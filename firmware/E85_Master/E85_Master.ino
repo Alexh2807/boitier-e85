@@ -31,6 +31,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <esp_now.h>
+#include <esp_idf_version.h>
 #include <esp_wifi.h>
 #include <esp_cpu.h>
 #include <esp_system.h>
@@ -287,10 +288,32 @@ static void fill_hdr(LinkHeader &h, uint8_t type) {
   h.magic = LINK_MAGIC & 0xFFFF; h.version = LINK_VERSION; h.type = type; h.seq = ++g_seq;
 }
 
+// ---- envoi DIRECT a la pedale des que son adresse est connue (accuse radio + repetitions) ----
+// Le regime (50 Hz) reste en diffusion : c'est grace a lui qu'une nouvelle pedale trouve le boitier.
+static uint8_t  g_ped_mac[6];
+static volatile bool g_ped_mac_new = false;
+static bool     g_ped_peer = false;
+static volatile uint32_t g_tx_ok = 0, g_tx_fail = 0;
+
+static void tx_ped(const void *msg, size_t len) {
+  esp_now_send(g_ped_peer ? g_ped_mac : BCAST, (const uint8_t *)msg, len);
+}
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static void on_sent(const wifi_tx_info_t *info, esp_now_send_status_t st) {
+  const uint8_t *dst = info ? info->des_addr : nullptr;
+#else
+static void on_sent(const uint8_t *dst, esp_now_send_status_t st) {
+#endif
+  if (!dst || dst[0] == 0xFF) return;            // diffusion : pas d'accuse
+  if (st == ESP_NOW_SEND_SUCCESS) g_tx_ok++; else g_tx_fail++;
+}
+
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  const uint8_t *src = info->src_addr;
 #else
-static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
+static void on_recv(const uint8_t *src, const uint8_t *data, int len) {
 #endif
   // diagnostic : on compte TOUT ce qui arrive, meme rejete (pedale muette ou incomprise ?)
   g_rx_n++; g_rx_ms = millis(); g_rx_len = len;
@@ -303,8 +326,8 @@ static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
   if (h->magic != (LINK_MAGIC & 0xFFFF) || h->version != LINK_VERSION) return;
   // telemetrie : accepte aussi les pedales d'une version precedente (PedConfig plus courte)
   // -> indispensable pour pouvoir leur envoyer la mise a jour
-  if (h->type == MSG_PED_TELEM && len <= (int)sizeof(MsgPedTelem)
-      && len >= (int)(sizeof(MsgPedTelem) - sizeof(PedConfig) + PEDCONFIG_V21_SIZE)) {
+  if (h->type == MSG_PED_TELEM && len <= (int)sizeof(MsgPedTelem) && len >= (int)PED_TELEM_MIN_SIZE) {
+    if (!g_ped_peer || memcmp(src, g_ped_mac, 6) != 0) { memcpy(g_ped_mac, src, 6); g_ped_mac_new = true; }
     portENTER_CRITICAL(&g_mux);
     memset(&g_telem, 0, sizeof(MsgPedTelem));
     memcpy(&g_telem, data, len);
@@ -330,17 +353,17 @@ static void send_status() {
 static void send_store() {
   MsgE85Store m = {};
   fill_hdr(m.h, MSG_E85_STORE); m.s = S;
-  esp_now_send(BCAST, (const uint8_t *)&m, sizeof(m));
+  tx_ped(&m, sizeof(m));
 }
 static void send_ped_cfg(const PedConfig &c) {
   MsgPedConfig m = {};
   fill_hdr(m.h, MSG_PED_CONFIG); m.cfg = c;
-  esp_now_send(BCAST, (const uint8_t *)&m, sizeof(m));
+  tx_ped(&m, sizeof(m));
 }
 static void send_ped_cmd(uint8_t cmd) {
   MsgPedCmd m = {};
   fill_hdr(m.h, MSG_PED_CMD); m.cmd = cmd;
-  for (int k = 0; k < 3; k++) { esp_now_send(BCAST, (const uint8_t *)&m, sizeof(m)); delay(5); }
+  for (int k = 0; k < 3; k++) { tx_ped(&m, sizeof(m)); delay(5); }
 }
 static bool ped_link() { return g_telem_valid && (millis() - g_telem_ms) < 600; }
 
@@ -390,8 +413,10 @@ static void send_json() {
       c.kp10 / 10.0f, c.ki10 / 10.0f, c.kd10 / 10.0f, c.anticip_ms, c.release_pct10 / 10.0f,
       c.crit_rpm, c.crit_pct10 / 10.0f, c.gmin_pct10 / 10.0f);
   }
-  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},\"pota\":{",
-                g_ped_pending, (unsigned long)g_rx_n, (unsigned long)(g_rx_ms ? millis() - g_rx_ms : 0), g_rx_len,
+  if (tv) n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"txok\":%u,\"txfail\":%u,\"prst\":%u,\"direct\":%u,\"pup\":%lu",
+                        t.tx_ok, t.tx_fail, t.rst, t.unicast, (unsigned long)t.up_s);
+  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"etx\":{\"ok\":%lu,\"fail\":%lu,\"direct\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},\"pota\":{",
+                g_ped_pending, (unsigned long)g_tx_ok, (unsigned long)g_tx_fail, (int)g_ped_peer, (unsigned long)g_rx_n, (unsigned long)(g_rx_ms ? millis() - g_rx_ms : 0), g_rx_len,
                 g_rx_type, g_rx_ver, g_rx_magic, (unsigned)sizeof(MsgPedTelem));
   n += snprintf(jbuf + n, sizeof(jbuf) - n, "\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
                 (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
@@ -489,7 +514,7 @@ static void start_espnow();
 static bool pota_xfer(const void *msg, size_t len, uint8_t stage, uint32_t timeout_ms, int retries) {
   for (int k = 0; k < retries; k++) {
     g_ack_new = false;
-    esp_now_send(BCAST, (const uint8_t *)msg, len);
+    tx_ped(msg, len);
     const uint32_t t0 = millis();
     while (millis() - t0 < timeout_ms) {
       if (g_ack_new && g_ack_stage == stage) return true;
@@ -600,6 +625,8 @@ static void start_espnow() {
   esp_now_deinit();
   if (esp_now_init() != ESP_OK) { Serial.println("[ESPNOW] init echec"); return; }
   esp_now_register_recv_cb(on_recv);
+  esp_now_register_send_cb(on_sent);
+  if (g_ped_peer) { g_ped_peer = false; g_ped_mac_new = true; }   // le pair direct sera re-ajoute
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, BCAST, 6);
   p.channel = LINK_CHANNEL; p.ifidx = WIFI_IF_AP; p.encrypt = false;
@@ -647,6 +674,17 @@ static void comm_task(void *) {
       PedConfig cur; portENTER_CRITICAL(&g_mux); cur = g_telem.cfg; portEXIT_CRITICAL(&g_mux);
       if (memcmp(&cur, &g_ped_des, sizeof(PedConfig)) == 0 || ms - g_ped_pending_ms > 4000) g_ped_pending = false;
       else send_ped_cfg(g_ped_des);
+    }
+
+    // --- adresse de la pedale apprise -> envoi direct ---
+    if (g_ped_mac_new) {
+      uint8_t mac[6]; portENTER_CRITICAL(&g_mux); memcpy(mac, g_ped_mac, 6); g_ped_mac_new = false; portEXIT_CRITICAL(&g_mux);
+      esp_now_peer_info_t p = {};
+      memcpy(p.peer_addr, mac, 6); p.channel = LINK_CHANNEL; p.ifidx = WIFI_IF_AP; p.encrypt = false;
+      if (esp_now_is_peer_exist(mac) || esp_now_add_peer(&p) == ESP_OK) {
+        g_ped_peer = true;
+        Serial.printf("[ESPNOW] pedale %02X:%02X:%02X:%02X:%02X:%02X -> envoi direct\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      }
     }
 
     // --- reglages recuperes depuis la pedale (au demarrage, si sa copie est plus recente) ---

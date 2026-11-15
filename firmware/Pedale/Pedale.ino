@@ -29,6 +29,7 @@
 #include <Wire.h>
 #include <Preferences.h>
 #include <esp_now.h>
+#include <esp_idf_version.h>
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
 #include <esp_ota_ops.h>
@@ -119,10 +120,31 @@ static uint8_t           g_ota_buf[sizeof(MsgOtaData)];
 static volatile int      g_ota_len = 0;
 static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+// ---- envoi DIRECT au boitier E85 (accuse de reception radio + repetitions automatiques) ----
+static uint8_t  g_e85_mac[6];
+static volatile bool g_e85_mac_new = false;      // adresse apprise dans le callback, ajoutee dans loop()
+static bool     g_e85_peer = false;              // pair direct enregistre
+static volatile uint16_t g_tx_ok = 0, g_tx_fail = 0;
+
+static void tx(const void *msg, size_t len) {
+  esp_now_send(g_e85_peer ? g_e85_mac : BCAST, (const uint8_t *)msg, len);
+}
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+static void on_sent(const wifi_tx_info_t *info, esp_now_send_status_t st) {
+#else
+static void on_sent(const uint8_t *mac, esp_now_send_status_t st) {
+#endif
+  if (!g_e85_peer) return;                       // en diffusion il n'y a pas d'accuse : rien a compter
+  if (st == ESP_NOW_SEND_SUCCESS) g_tx_ok++; else g_tx_fail++;
+}
+
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  const uint8_t *src = info->src_addr;
 #else
 static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
+  const uint8_t *src = mac;
 #endif
   if (len < (int)sizeof(LinkHeader)) return;
   const LinkHeader *h = (const LinkHeader *)data;
@@ -133,6 +155,7 @@ static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
       if (len == sizeof(MsgE85Status)) {
         const MsgE85Status *m = (const MsgE85Status *)data;
         g_rpm = m->rpm; g_rate = m->rpm_rate; g_engine_on = m->engine_on; g_link_ms = millis();
+        if (!g_e85_peer || memcmp(src, g_e85_mac, 6) != 0) { memcpy(g_e85_mac, src, 6); g_e85_mac_new = true; }
       } break;
     case MSG_PED_CONFIG:   // accepte aussi un boitier E85 d'une version precedente (config plus courte)
       if (len <= (int)sizeof(MsgPedConfig) && len >= (int)(sizeof(LinkHeader) + PEDCONFIG_V21_SIZE)) {
@@ -162,7 +185,7 @@ static bool ota_restart_pending = false;
 static void ota_ack(uint8_t stage, uint8_t status) {
   MsgOtaAck a = {}; hdr(a.h, MSG_OTA_ACK);
   a.stage = stage; a.status = status; a.next = ota_next;
-  esp_now_send(BCAST, (const uint8_t *)&a, sizeof(a));
+  tx(&a, sizeof(a));
 }
 static void ota_abort() {
   if (ota_active) { esp_ota_abort(ota_h); ota_active = false; Serial.println("[OTA] abandon"); }
@@ -279,12 +302,14 @@ static void send_telem() {
   t.cal_rel1 = CAL.rel1; t.cal_rel2 = CAL.rel2; t.cal_full1 = CAL.full1; t.cal_full2 = CAL.full2;
   t.e85_rev = E85S.rev; t.fw_build = PROJECT_BUILD;
   t.cfg = CFG;
-  esp_now_send(BCAST, (const uint8_t *)&t, sizeof(t));
+  t.tx_ok = g_tx_ok; t.tx_fail = g_tx_fail; t.rst = (uint8_t)esp_reset_reason();
+  t.unicast = g_e85_peer ? 1 : 0; t.up_s = millis() / 1000;
+  tx(&t, sizeof(t));
 }
 static void send_e85_copy() {
   if (!E85S.rev) return;
   MsgE85Store m = {}; hdr(m.h, MSG_E85_RESTORE); m.s = E85S;
-  esp_now_send(BCAST, (const uint8_t *)&m, sizeof(m));
+  tx(&m, sizeof(m));
 }
 
 static void handle_cmd(uint8_t c, uint32_t ms) {
@@ -331,6 +356,7 @@ void setup() {
   esp_wifi_set_channel(LINK_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(on_recv);
+    esp_now_register_send_cb(on_sent);
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, BCAST, 6); p.channel = 0; p.ifidx = WIFI_IF_STA; p.encrypt = false;
     esp_now_add_peer(&p);
@@ -367,6 +393,17 @@ void loop() {
   }
   if (e85n && e85.rev > E85S.rev) { E85S = e85; dirty_e85 = ms; }
   const bool link = lms && (ms - lms) < LINK_TIMEOUT_MS;
+
+  // adresse du boitier E85 apprise -> envoi direct (accuse de reception + repetitions radio)
+  if (g_e85_mac_new) {
+    uint8_t mac[6]; portENTER_CRITICAL(&mux); memcpy(mac, g_e85_mac, 6); g_e85_mac_new = false; portEXIT_CRITICAL(&mux);
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, mac, 6); p.channel = 0; p.ifidx = WIFI_IF_STA; p.encrypt = false;
+    if (esp_now_is_peer_exist(mac) || esp_now_add_peer(&p) == ESP_OK) {
+      g_e85_peer = true;
+      Serial.printf("[ESPNOW] boitier E85 %02X:%02X:%02X:%02X:%02X:%02X -> envoi direct\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+  }
   ota_process(ms);
 
   // --- mesures (2 conversions ADS, ~2,6 ms) ---
@@ -392,7 +429,7 @@ void loop() {
   // ===================== AIDE AU RALENTI =====================
   const PedConfig &c = CFG;
   const bool released = pedal_pct < c.release_pct10 / 10.0f;
-  const bool usable = link && c.assist_en && calibrated && eng && rpm > 0 && !ota_active;
+  const bool usable = link && c.assist_en && calibrated && eng && rpm > 0;   // l'aide continue meme pendant une mise a jour
   const float predicted = (float)rpm + (float)rate * c.anticip_ms / 1000.0f;   // rate < 0 en deceleration
   const float minp = c.min_pct10 / 10.0f, maxp = max(c.max_pct10 / 10.0f, minp);
 
@@ -429,7 +466,7 @@ void loop() {
   // --- SEUIL CRITIQUE : sous ce regime, ouverture forcee IMMEDIATE (sans rampe) ---
   // S'applique pied leve comme pied pose : le calculateur recoit le plus grand des deux.
   critical = false;
-  if (link && c.assist_en && calibrated && eng && rpm > 0 && !ota_active && c.crit_rpm && rpm < c.crit_rpm) {
+  if (link && c.assist_en && calibrated && eng && rpm > 0 && c.crit_rpm && rpm < c.crit_rpm) {
     critical = true;
     const float cp = c.crit_pct10 / 10.0f;
     if (assist < cp) assist = cp;
@@ -471,7 +508,8 @@ void loop() {
   if (ms - t_telem >= 50) { t_telem = ms; send_telem(); }
   if (ms - t_log >= 2000) {
     t_log = ms;
-    Serial.printf("[PED] in=%u/%u out=%u/%u ped=%.1f%% aide=%.1f%% appris=%.1f%% act=%d mode=%u rpm=%u (%d/s) lien=%d ads=%d dac=%d\n",
-      (unsigned)f_in1, (unsigned)f_in2, out1, out2, pedal_pct, assist, learned, active, mode, rpm, rate, link, g_ads_ok, g_dac_ok);
+    Serial.printf("[PED] in=%u/%u out=%u/%u ped=%.1f%% aide=%.1f%% appris=%.1f%% act=%d mode=%u rpm=%u (%d/s) lien=%d ads=%d dac=%d envois ok=%u perdus=%u direct=%d\n",
+      (unsigned)f_in1, (unsigned)f_in2, out1, out2, pedal_pct, assist, learned, active, mode, rpm, rate, link, g_ads_ok, g_dac_ok,
+      g_tx_ok, g_tx_fail, g_e85_peer);
   }
 }

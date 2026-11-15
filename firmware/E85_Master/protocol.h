@@ -4,10 +4,11 @@
 // =====================================================================
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.3.2"
-#define PROJECT_BUILD   232         // entier croissant (2.3.2 -> 232)
+#define PROJECT_VERSION "2.4.0"
+#define PROJECT_BUILD   240         // entier croissant (2.4.0 -> 240)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2
@@ -113,7 +114,14 @@ struct MsgPedTelem {
   uint32_t e85_rev;            // revision des reglages E85 memorises (0 = aucun)
   uint16_t fw_build;           // PROJECT_BUILD du firmware pedale
   PedConfig cfg;
+  // --- ajoute en 2.4.0 (toujours en FIN de message) ---
+  uint16_t tx_ok, tx_fail;     // envois de la pedale vers le boitier E85 : acquittes / perdus (depuis le demarrage)
+  uint8_t  rst;                // cause du dernier redemarrage de la pedale (esp_reset_reason)
+  uint8_t  unicast;            // 1 = la pedale envoie en direct au boitier E85 (adresse connue)
+  uint32_t up_s;               // temps de fonctionnement de la pedale (s)
 };
+// plus petite telemetrie acceptee : celle d'une pedale 2.1 (PedConfig de 24 octets, rien apres)
+#define PED_TELEM_MIN_SIZE (offsetof(MsgPedTelem, cfg) + PEDCONFIG_V21_SIZE)
 
 struct MsgOtaBegin { LinkHeader h; uint32_t size; uint16_t build; };
 struct MsgOtaData  { LinkHeader h; uint32_t offset; uint16_t len; uint8_t data[OTA_CHUNK]; };

@@ -328,7 +328,12 @@ function render(j,t0=0){
   $('vPed').textContent=p.build?('build '+p.build+(p.build==j.build?' ✓':' → mise à jour '+j.build)):'–';
   updUI(j);
   const RST=['?','mise sous tension','ext','logiciel','PLANTAGE','watchdog int','watchdog tâche','watchdog','veille','BROWNOUT (alim)','SDIO'];
-  $('info').innerHTML=`En marche depuis ${Math.floor(j.up/60)} min · dernier redémarrage : ${RST[j.rst]||j.rst}<br>Mémoire libre : ${Math.round(j.heap/1024)} Ko · révision réglages : ${j.rev}`;
+  const ex=j.etx||{},rx=j.rx||{};
+  let radio=`<br><br><b>Liaison radio</b><br>Boîtier E85 → pédale : ${ex.direct?'direct':'diffusion'}${ex.direct?` · ${ex.ok} acquittés, ${ex.fail} perdus`:''}`+
+    `<br>Reçus par le boîtier E85 : ${rx.n||0} message(s)${rx.n?`, dernier il y a ${fmt((rx.age||0)/1000,1)} s`:''}`;
+  if(p.txok!==undefined)radio+=`<br>Pédale → boîtier E85 : ${p.direct?'direct':'diffusion'} · ${p.txok} acquittés, ${p.txfail} perdus`+
+    `<br>Pédale : en marche depuis ${Math.floor(p.pup/60)} min, dernier redémarrage : ${RST[p.prst]||p.prst}`;
+  $('info').innerHTML=`En marche depuis ${Math.floor(j.up/60)} min · dernier redémarrage : ${RST[j.rst]||j.rst}<br>Mémoire libre : ${Math.round(j.heap/1024)} Ko · révision réglages : ${j.rev}`+radio;
 }
 function bind2(id){document.querySelectorAll('#'+id+' [data-k]').forEach(e=>{
   ['pointerdown','touchstart','focus','input'].forEach(ev=>e.addEventListener(ev,touched,{passive:true}));
