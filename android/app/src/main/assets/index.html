@@ -343,7 +343,11 @@ function updUI(j){
   const po=j.pota||{};
   const pd=j.ped||{},pedOld=pd.build&&pd.build!=j.build;
   if(po.st==1){const pc=po.size?Math.round(100*po.done/po.size):0;
-    h=`<p>Mise à jour du boîtier pédale : ${pc} %</p><div class="prog"><i style="width:${pc}%"></i></div><p class="muted">La pédale fonctionne normalement pendant le transfert (aide au ralenti en pause).</p>`;bn='Mise à jour du boîtier pédale en cours : '+pc+' %'}
+    h=po.blind
+      ?`<p>Envoi à l'aveugle à la pédale : ${pc} %</p><div class="prog"><i style="width:${pc}%"></i></div><p class="muted">La pédale ne peut pas répondre, le firmware est envoyé 3 fois, lentement (4 à 5 min). Laisse le contact mis. Si un morceau manque, la pédale refuse simplement la mise à jour et garde sa version.</p>`
+      :`<p>Mise à jour du boîtier pédale : ${pc} %</p><div class="prog"><i style="width:${pc}%"></i></div><p class="muted">La pédale fonctionne normalement pendant le transfert.</p>`;
+    bn='Mise à jour du boîtier pédale en cours : '+pc+' %'}
+  else if(po.st==4&&pedOld)h=`<p style="color:var(--acc)">Firmware envoyé à l'aveugle. Si tout est arrivé, la pédale redémarre en build ${j.build} et réapparaît d'ici quelques secondes.</p><p class="muted">Si sa version ne change pas, un morceau s'est perdu : relance.</p><button onclick="forcePed()">Relancer l'envoi</button>`;
   else if(pd.flags&64)h='<p style="color:var(--acc)">Mise à jour reçue : la pédale redémarrera dès que tu lèveras le pied.</p>';
   else if(po.st==2&&!pedOld)h='<p style="color:var(--ok)">✓ Boîtier pédale mis à jour.</p>';
   else if(po.st==3&&!pd.link)h=`<p style="color:var(--bad)">Échec de la mise à jour pédale (étape ${po.err}) : elle n'a pas répondu.</p><button onclick="forcePed()">Réessayer (forcer)</button>`;

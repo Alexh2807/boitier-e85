@@ -267,7 +267,8 @@ static volatile bool     g_ack_new = false;
 static E85Settings g_restore;
 static volatile bool g_restore_new = false;
 static PedConfig g_ped_des;
-enum { POTA_IDLE = 0, POTA_RUN = 1, POTA_OK = 2, POTA_FAIL = 3 };
+enum { POTA_IDLE = 0, POTA_RUN = 1, POTA_OK = 2, POTA_FAIL = 3, POTA_SENT = 4 };   // SENT = envoye a l'aveugle, sans confirmation
+static volatile bool     g_pota_blind = false;
 static volatile int      g_pota_state = POTA_IDLE;
 static volatile uint32_t g_pota_done = 0;
 static volatile uint8_t  g_pota_err = 0;
@@ -418,8 +419,8 @@ static void send_json() {
   n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"etx\":{\"ok\":%lu,\"fail\":%lu,\"direct\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},\"pota\":{",
                 g_ped_pending, (unsigned long)g_tx_ok, (unsigned long)g_tx_fail, (int)g_ped_peer, (unsigned long)g_rx_n, (unsigned long)(g_rx_ms ? millis() - g_rx_ms : 0), g_rx_len,
                 g_rx_type, g_rx_ver, g_rx_magic, (unsigned)sizeof(MsgPedTelem));
-  n += snprintf(jbuf + n, sizeof(jbuf) - n, "\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
-                (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
+  n += snprintf(jbuf + n, sizeof(jbuf) - n, "\"blind\":%d,\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
+                (int)g_pota_blind, (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
   cors();
   server.send(200, "application/json", jbuf);
 }
@@ -524,37 +525,63 @@ static bool pota_xfer(const void *msg, size_t len, uint8_t stage, uint32_t timeo
   return false;
 }
 
+// Envoi "a l'aveugle" : quand la pedale ne peut pas repondre (sa radio n'arrive pas jusqu'au
+// boitier E85), chaque morceau est envoye 3 fois, assez lentement pour qu'elle ait le temps
+// de l'ecrire. Elle ignore les doublons, et verifie l'empreinte complete du firmware a la fin :
+// s'il manque un seul morceau, elle refuse la mise a jour et garde sa version (aucun risque).
+static void pota_blind(uint32_t from) {
+  g_pota_blind = true;
+  Serial.printf("[PED-OTA] pas de reponse -> envoi a l'aveugle depuis %lu\n", (unsigned long)from);
+  if (from == 0) {
+    MsgOtaBegin b = {}; fill_hdr(b.h, MSG_OTA_BEGIN); b.size = PEDAL_FW_SIZE; b.build = PROJECT_BUILD;
+    for (int k = 0; k < 5; k++) { tx_ped(&b, sizeof(b)); vTaskDelay(pdMS_TO_TICKS(300)); }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+  uint32_t n = 0;
+  for (uint32_t off = from; off < PEDAL_FW_SIZE; off += OTA_CHUNK) {
+    MsgOtaData d; memset(&d, 0, sizeof(d)); fill_hdr(d.h, MSG_OTA_DATA);
+    d.offset = off; d.len = min<uint32_t>(OTA_CHUNK, PEDAL_FW_SIZE - off);
+    memcpy_P(d.data, PEDAL_FW + off, d.len);
+    for (int k = 0; k < 3; k++) { tx_ped(&d, sizeof(d)); vTaskDelay(pdMS_TO_TICKS(18)); }
+    g_pota_done = off + d.len;
+    if (++n % 18 == 0) vTaskDelay(pdMS_TO_TICKS(200));   // la pedale efface un secteur de 4 Ko environ tous les 18 morceaux
+  }
+  vTaskDelay(pdMS_TO_TICKS(300));
+  MsgOtaEnd e = {}; fill_hdr(e.h, MSG_OTA_END); e.size = PEDAL_FW_SIZE;
+  for (int k = 0; k < 5; k++) { tx_ped(&e, sizeof(e)); vTaskDelay(pdMS_TO_TICKS(300)); }
+}
+
 static void pota_task(void *) {
-  g_pota_state = POTA_RUN; g_pota_done = 0; g_pota_err = 0;
+  g_pota_state = POTA_RUN; g_pota_done = 0; g_pota_err = 0; g_pota_blind = false;
   Serial.printf("[PED-OTA] envoi firmware pedale build %d (%lu octets)\n", PROJECT_BUILD, (unsigned long)PEDAL_FW_SIZE);
-  bool ok = false;
+  int result = POTA_FAIL;
   do {
     MsgOtaBegin b = {}; fill_hdr(b.h, MSG_OTA_BEGIN); b.size = PEDAL_FW_SIZE; b.build = PROJECT_BUILD;
-    // l'effacement du premier secteur peut prendre du temps
-    if (!pota_xfer(&b, sizeof(b), 1, 800, 8) || g_ack_status != OTA_OK) { g_pota_err = 1; break; }
-    uint32_t off = 0; int fails = 0;
+    if (!pota_xfer(&b, sizeof(b), 1, 800, 4)) { pota_blind(0); result = POTA_SENT; break; }   // aucune reponse
+    if (g_ack_status != OTA_OK) { g_pota_err = 1; break; }
+    uint32_t off = 0; int fails = 0; bool blind = false;
     while (off < PEDAL_FW_SIZE) {
       MsgOtaData d; memset(&d, 0, sizeof(d)); fill_hdr(d.h, MSG_OTA_DATA);
       d.offset = off; d.len = min<uint32_t>(OTA_CHUNK, PEDAL_FW_SIZE - off);
       memcpy_P(d.data, PEDAL_FW + off, d.len);
       if (!pota_xfer(&d, sizeof(d), 2, 300, 1) || g_ack_status != OTA_OK) {
-        if (++fails > 40) { g_pota_err = 2; break; }
+        if (++fails > 15) { pota_blind(off); blind = true; break; }   // les reponses ne passent plus
         continue;
       }
       fails = 0;
       off = g_ack_next;                                  // la pedale dit ou reprendre
       g_pota_done = off;
     }
-    if (g_pota_err) break;
+    if (blind) { result = POTA_SENT; break; }
     MsgOtaEnd e = {}; fill_hdr(e.h, MSG_OTA_END); e.size = PEDAL_FW_SIZE;
-    if (!pota_xfer(&e, sizeof(e), 3, 1500, 5) || g_ack_status != OTA_OK) { g_pota_err = 3; break; }
-    ok = true;
+    if (!pota_xfer(&e, sizeof(e), 3, 1500, 5)) { result = POTA_SENT; break; }   // fin envoyee, pas de confirmation
+    if (g_ack_status != OTA_OK) { g_pota_err = 3; break; }
+    result = POTA_OK;
   } while (0);
-  g_pota_state = ok ? POTA_OK : POTA_FAIL;
-  Serial.printf("[PED-OTA] %s (err=%u)\n", ok ? "succes" : "ECHEC", g_pota_err);
+  g_pota_state = result;
+  Serial.printf("[PED-OTA] %s (err=%u)\n", result == POTA_OK ? "succes" : result == POTA_SENT ? "envoye sans confirmation" : "ECHEC", g_pota_err);
   vTaskDelete(nullptr);
 }
-
 static bool pota_start(bool force = false) {
   if (g_pota_state == POTA_RUN || g_e85_ota) return false;
   if (!force && !ped_link()) return false;

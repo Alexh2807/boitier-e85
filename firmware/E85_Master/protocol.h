@@ -7,8 +7,8 @@
 #include <stddef.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.4.0"
-#define PROJECT_BUILD   240         // entier croissant (2.4.0 -> 240)
+#define PROJECT_VERSION "2.4.1"
+#define PROJECT_BUILD   241         // entier croissant (2.4.1 -> 241)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2
