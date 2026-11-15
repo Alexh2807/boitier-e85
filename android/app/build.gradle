@@ -1,0 +1,48 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Version passee par tools/build_all.ps1 (-PappVersion=2.1.0 -PappBuild=210)
+def appVersion = project.findProperty('appVersion') ?: '2.1.0'
+def appBuild   = (project.findProperty('appBuild') ?: '210') as int
+
+// Cle de signature : android/keystore.properties (NON publie sur GitHub, a sauvegarder !)
+def ksProps = new Properties()
+def ksFile = rootProject.file('keystore.properties')
+if (ksFile.exists()) ksProps.load(new FileInputStream(ksFile))
+
+android {
+    namespace 'fr.boitiere85'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId 'fr.boitiere85'
+        minSdk 29          // Android 10 (WifiNetworkSpecifier)
+        targetSdk 36
+        versionCode appBuild
+        versionName appVersion
+    }
+
+    signingConfigs {
+        release {
+            if (ksFile.exists()) {
+                storeFile rootProject.file(ksProps['storeFile'])
+                storePassword ksProps['storePassword']
+                keyAlias ksProps['keyAlias']
+                keyPassword ksProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig ksFile.exists() ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}

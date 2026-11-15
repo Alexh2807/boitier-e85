@@ -1,0 +1,20 @@
+# sauvegardes des firmwares d'origine et binaires (jamais publies)
+*.bin
+sauvegardes_origine/
+build/
+livrables/
+# fichiers generes par tools/build_all.ps1
+firmware/E85_Master/pedal_fw.h
+firmware/Pedale/protocol.h
+android/app/src/main/assets/firmware.json
+# outils telecharges
+tools/arduino-cli/
+# Android : cle de signature (SECRETE) et fichiers locaux
+android/keystore/
+android/keystore.properties
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+.claude/
+page_web_recuperee.html
