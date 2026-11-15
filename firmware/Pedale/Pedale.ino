@@ -157,6 +157,7 @@ static esp_ota_handle_t ota_h = 0;
 static const esp_partition_t *ota_part = nullptr;
 static uint32_t ota_size = 0, ota_next = 0, ota_last_ms = 0;
 static bool ota_active = false;
+static bool ota_restart_pending = false;
 
 static void ota_ack(uint8_t stage, uint8_t status) {
   MsgOtaAck a = {}; hdr(a.h, MSG_OTA_ACK);
@@ -196,9 +197,23 @@ static void ota_process(uint32_t ms) {
     esp_err_t e = esp_ota_end(ota_h); ota_active = false;
     if (e != ESP_OK || esp_ota_set_boot_partition(ota_part) != ESP_OK) { ota_ack(3, OTA_ERR_VERIFY); return; }
     for (int k = 0; k < 3; k++) { ota_ack(3, OTA_OK); delay(20); }
-    Serial.println("[OTA] succes -> redemarrage");
+    // Le redemarrage attend que la pedale soit relachee (voir ota_restart_when_safe) :
+    // jamais de coupure de l'accelerateur pendant que le conducteur appuie.
+    ota_restart_pending = true;
+    Serial.println("[OTA] succes -> redemarrage des que la pedale est relachee");
+  }
+}
+
+// Redemarre sur la nouvelle version seulement pied leve depuis 1,5 s (ou moteur arrete).
+static void ota_restart_when_safe(uint32_t ms, bool released, bool engine) {
+  static uint32_t rel_since = 0;
+  if (!ota_restart_pending) return;
+  if (!released) { rel_since = 0; return; }
+  if (!rel_since) rel_since = ms;
+  if (!engine || ms - rel_since > 1500) {
+    Serial.println("[OTA] redemarrage");
     save_dirty(ms + 100000);
-    delay(200);
+    delay(50);
     esp_restart();
   }
 }
@@ -260,7 +275,7 @@ static void send_telem() {
   t.mode = mode;
   const bool link = g_link_ms && (millis() - g_link_ms) < LINK_TIMEOUT_MS;
   t.flags = (calibrated ? 1 : 0) | (link ? 2 : 0) | ((dirty_cfg || dirty_cal || dirty_e85) ? 4 : 0)
-          | ((g_dac_ok && g_ads_ok) ? 8 : 0) | (active ? 16 : 0) | (critical ? 32 : 0);
+          | ((g_dac_ok && g_ads_ok) ? 8 : 0) | (active ? 16 : 0) | (critical ? 32 : 0) | (ota_restart_pending ? 64 : 0);
   t.cal_rel1 = CAL.rel1; t.cal_rel2 = CAL.rel2; t.cal_full1 = CAL.full1; t.cal_full2 = CAL.full2;
   t.e85_rev = E85S.rev; t.fw_build = PROJECT_BUILD;
   t.cfg = CFG;
@@ -297,11 +312,17 @@ void setup() {
 
   Wire.begin(PIN_SDA, PIN_SCL, 400000);
   Wire.setTimeOut(5);
-  g_dac_ok = dac_write(DAC1_ADDR, CAL.rel1) & dac_write(DAC2_ADDR, CAL.rel2);   // pedale relachee d'abord
-  uint16_t v;
-  g_ads_ok = ads_read_mv(ADS_CH_P1, v);
+  // Au demarrage : on recopie TOUT DE SUITE la vraie position de la pedale
+  // (si le boitier redemarre pendant que le conducteur accelere, pas de coupure).
+  uint16_t v1, v2;
+  g_ads_ok = ads_read_mv(ADS_CH_P1, v1) && ads_read_mv(ADS_CH_P2, v2);
+  if (g_ads_ok && v1 > 100 && v1 < 4950 && v2 > 50 && v2 < 4950) {
+    f_in1 = v1; f_in2 = v2;
+    g_dac_ok = dac_write(DAC1_ADDR, v1) & dac_write(DAC2_ADDR, v2);
+  } else {
+    g_dac_ok = dac_write(DAC1_ADDR, CAL.rel1) & dac_write(DAC2_ADDR, CAL.rel2);   // lecture impossible : relachee
+  }
   Serial.printf("[I2C] MCP4725 0x61/0x60 %s  ADS1115 0x48 %s\n", g_dac_ok ? "OK" : "ERREUR", g_ads_ok ? "OK" : "ERREUR");
-  if (g_ads_ok) { f_in1 = v; if (ads_read_mv(ADS_CH_P2, v)) f_in2 = v; }
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
@@ -445,6 +466,7 @@ void loop() {
 #endif
 
   if (!ota_active) save_dirty(ms);
+  ota_restart_when_safe(ms, released || mode == 3, link && eng);
 
   if (ms - t_telem >= 50) { t_telem = ms; send_telem(); }
   if (ms - t_log >= 2000) {

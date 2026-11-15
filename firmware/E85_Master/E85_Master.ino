@@ -523,8 +523,9 @@ static bool pota_start() {
   return true;
 }
 
+// Manuel (bouton de l'appli) : autorise moteur tournant. La pedale continue de fonctionner
+// pendant le transfert et ne redemarre qu'une fois le pied leve.
 static void h_pedota() {
-  if (g_engine_on) { cors(); server.send(409, "application/json", "{\"err\":\"Arrete le moteur avant la mise a jour\"}"); return; }
   if (!pota_start()) { cors(); server.send(409, "application/json", "{\"err\":\"Pedale absente ou mise a jour deja en cours\"}"); return; }
   send_json();
 }
