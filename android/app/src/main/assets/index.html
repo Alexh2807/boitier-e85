@@ -302,6 +302,12 @@ function render(j,t0=0){
   const p=j.ped||{};const L=p.link;
   $('pPed').textContent=L?'Pédale ✓':'Pédale ✕';$('pPed').style.color=L?'var(--ok)':'var(--bad)';
   $('pedOff').style.display=L?'none':'';
+  if(!L){const r=j.rx||{};let d;
+    if(!r.n)d='Aucun message ESP-NOW reçu depuis le démarrage du boîtier E85 : la pédale ne tourne pas (alimentation ?) ou ne capte pas.';
+    else if(r.age>3000)d=`Dernier message reçu il y a ${Math.round(r.age/1000)} s : la pédale s'est arrêtée ou ne capte plus.`;
+    else d=`La pédale parle mais n'est pas comprise (type ${r.type}, version ${r.ver}, ${r.len} octets au lieu de ${r.exp}) : une mise à jour forcée devrait corriger.`;
+    const html=`Boîtier pédale non détecté (ESP-NOW).<br><small>${d}</small><br><br><button onclick="forcePed()">Forcer la mise à jour de la pédale</button>`;
+    if($('pedOff').innerHTML!==html)$('pedOff').innerHTML=html}
   $('rateV').textContent=(j.rate>0?'+':'')+j.rate+' tr/min/s';
   if(p.in1!==undefined){
     const mv=v=>fmt(v/1000,3)+' V';
@@ -335,6 +341,7 @@ function updUI(j){
     h=`<p>Mise à jour du boîtier pédale : ${pc} %</p><div class="prog"><i style="width:${pc}%"></i></div><p class="muted">La pédale fonctionne normalement pendant le transfert (aide au ralenti en pause).</p>`;bn='Mise à jour du boîtier pédale en cours : '+pc+' %'}
   else if(pd.flags&64)h='<p style="color:var(--acc)">Mise à jour reçue : la pédale redémarrera dès que tu lèveras le pied.</p>';
   else if(po.st==2&&!pedOld)h='<p style="color:var(--ok)">✓ Boîtier pédale mis à jour.</p>';
+  else if(po.st==3&&!pd.link)h=`<p style="color:var(--bad)">Échec de la mise à jour pédale (étape ${po.err}) : elle n'a pas répondu.</p><button onclick="forcePed()">Réessayer (forcer)</button>`;
   else if(po.st==3&&pedOld)h=`<p style="color:var(--bad)">Échec de la mise à jour pédale (étape ${po.err}).</p><button onclick="pedUpd()">Réessayer</button>`;
   else if(pedOld&&pd.link)h=`<button onclick="pedUpd()">Mettre à jour la pédale maintenant</button>`;
   if(FW&&!uploading){
@@ -349,6 +356,9 @@ function updUI(j){
 function pedUpd(){
   if(S&&S.on&&!confirm('Mettre à jour la pédale moteur tournant ?\n\nLa pédale fonctionne normalement pendant le transfert (environ 1 minute, aide au ralenti en pause). Elle redémarre ensuite seulement quand tu lèves le pied (environ 1 seconde).'))return;
   api('/api/pedota').catch(()=>toast('Envoi impossible'))}
+function forcePed(){
+  if(!confirm('Forcer l\'envoi du firmware à la pédale, même non détectée ?\n\nÇa ne marche que si la pédale est alimentée et allumée. Si elle ne répond pas, la tentative échouera sans risque.'))return;
+  api('/api/pedota',{force:1}).then(()=>{tab(3);toast('Mise à jour forcée lancée')}).catch(()=>toast('Envoi impossible'))}
 function loadFw(){const x=new XMLHttpRequest();x.open('GET','firmware.json');x.onload=()=>{try{FW=JSON.parse(x.responseText)}catch(e){}};x.send()}
 function flashE85(){
   if(!S)return;if(S.on){toast('Arrête le moteur avant la mise à jour');return}

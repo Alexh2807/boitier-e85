@@ -278,6 +278,11 @@ static uint32_t  g_sync_ms = 0;
 static bool      g_ped_pending = false;
 static uint32_t  g_ped_pending_ms = 0;
 
+static volatile uint32_t g_rx_n = 0, g_rx_ms = 0;
+static volatile int      g_rx_len = 0;
+static volatile uint8_t  g_rx_type = 0, g_rx_ver = 0;
+static volatile uint16_t g_rx_magic = 0;
+
 static void fill_hdr(LinkHeader &h, uint8_t type) {
   h.magic = LINK_MAGIC & 0xFFFF; h.version = LINK_VERSION; h.type = type; h.seq = ++g_seq;
 }
@@ -287,6 +292,12 @@ static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int le
 #else
 static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
+  // diagnostic : on compte TOUT ce qui arrive, meme rejete (pedale muette ou incomprise ?)
+  g_rx_n++; g_rx_ms = millis(); g_rx_len = len;
+  if (len >= (int)sizeof(LinkHeader)) {
+    const LinkHeader *hh = (const LinkHeader *)data;
+    g_rx_type = hh->type; g_rx_ver = hh->version; g_rx_magic = hh->magic;
+  }
   if (len < (int)sizeof(LinkHeader)) return;
   const LinkHeader *h = (const LinkHeader *)data;
   if (h->magic != (LINK_MAGIC & 0xFFFF) || h->version != LINK_VERSION) return;
@@ -379,8 +390,11 @@ static void send_json() {
       c.kp10 / 10.0f, c.ki10 / 10.0f, c.kd10 / 10.0f, c.anticip_ms, c.release_pct10 / 10.0f,
       c.crit_rpm, c.crit_pct10 / 10.0f, c.gmin_pct10 / 10.0f);
   }
-  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"pota\":{\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
-                g_ped_pending, (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
+  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},\"pota\":{",
+                g_ped_pending, (unsigned long)g_rx_n, (unsigned long)(g_rx_ms ? millis() - g_rx_ms : 0), g_rx_len,
+                g_rx_type, g_rx_ver, g_rx_magic, (unsigned)sizeof(MsgPedTelem));
+  n += snprintf(jbuf + n, sizeof(jbuf) - n, "\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
+                (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
   cors();
   server.send(200, "application/json", jbuf);
 }
@@ -516,8 +530,9 @@ static void pota_task(void *) {
   vTaskDelete(nullptr);
 }
 
-static bool pota_start() {
-  if (g_pota_state == POTA_RUN || !ped_link() || g_e85_ota) return false;
+static bool pota_start(bool force = false) {
+  if (g_pota_state == POTA_RUN || g_e85_ota) return false;
+  if (!force && !ped_link()) return false;
   g_pota_last_try = millis(); g_pota_tries++;
   xTaskCreatePinnedToCore(pota_task, "pota", 6144, nullptr, 2, nullptr, 0);
   return true;
@@ -526,7 +541,8 @@ static bool pota_start() {
 // Manuel (bouton de l'appli) : autorise moteur tournant. La pedale continue de fonctionner
 // pendant le transfert et ne redemarre qu'une fois le pied leve.
 static void h_pedota() {
-  if (!pota_start()) { cors(); server.send(409, "application/json", "{\"err\":\"Pedale absente ou mise a jour deja en cours\"}"); return; }
+  const bool force = server.arg("force").toInt() != 0;   // envoi meme si la pedale n'est pas detectee
+  if (!pota_start(force)) { cors(); server.send(409, "application/json", "{\"err\":\"Pedale absente ou mise a jour deja en cours\"}"); return; }
   send_json();
 }
 
