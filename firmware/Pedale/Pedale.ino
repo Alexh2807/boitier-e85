@@ -51,7 +51,8 @@
 struct Cal { uint16_t rel1, rel2, full1, full2; };
 static const PedConfig CFG_DEFAULT = {
   /*assist_en*/ 0, 0, /*target*/ 950, /*tol*/ 50, /*engage*/ 1300, /*off*/ 2500,
-  /*min*/ 0, /*max*/ 150, /*kp*/ 20, /*ki*/ 10, /*kd*/ 5, /*anticip*/ 300, /*release*/ 30
+  /*min*/ 0, /*max*/ 150, /*kp*/ 20, /*ki*/ 10, /*kd*/ 5, /*anticip*/ 300, /*release*/ 30,
+  /*crit_rpm*/ 0, /*crit_pct*/ 0          // seuil critique desactive par defaut
 };
 static const Cal CAL_DEFAULT = { 396, 186, 3793, 1888 };   // releve sur le firmware d'origine
 
@@ -68,7 +69,9 @@ static bool cal_valid(const Cal &c) {
 static void load_all() {
   CFG = CFG_DEFAULT; CAL = CAL_DEFAULT; memset(&E85S, 0, sizeof(E85S));
   prefs.begin("ped3", true);
-  if (prefs.getBytesLength("cfg") == sizeof(PedConfig)) prefs.getBytes("cfg", &CFG, sizeof(PedConfig));
+  const size_t cl = prefs.getBytesLength("cfg");
+  if (cl == sizeof(PedConfig)) prefs.getBytes("cfg", &CFG, sizeof(PedConfig));
+  else if (cl == PEDCONFIG_V21_SIZE) { prefs.getBytes("cfg", &CFG, PEDCONFIG_V21_SIZE); dirty_cfg = 1; }  // reglages 2.1 conserves
   bool have_cal = prefs.getBytesLength("cal") == sizeof(Cal);
   if (have_cal) prefs.getBytes("cal", &CAL, sizeof(Cal));
   if (prefs.getBytesLength("e85") == sizeof(E85Settings)) prefs.getBytes("e85", &E85S, sizeof(E85Settings));
@@ -130,8 +133,12 @@ static void on_recv(const uint8_t *mac, const uint8_t *data, int len) {
         const MsgE85Status *m = (const MsgE85Status *)data;
         g_rpm = m->rpm; g_rate = m->rpm_rate; g_engine_on = m->engine_on; g_link_ms = millis();
       } break;
-    case MSG_PED_CONFIG:
-      if (len == sizeof(MsgPedConfig)) { g_cfg_rx = ((const MsgPedConfig *)data)->cfg; g_cfg_new = true; } break;
+    case MSG_PED_CONFIG:   // accepte aussi un boitier E85 d'une version precedente (config plus courte)
+      if (len <= (int)sizeof(MsgPedConfig) && len >= (int)(sizeof(LinkHeader) + PEDCONFIG_V21_SIZE)) {
+        PedConfig c = CFG;                                      // champs absents -> valeur actuelle
+        memcpy(&c, data + sizeof(LinkHeader), len - sizeof(LinkHeader));
+        g_cfg_rx = c; g_cfg_new = true;
+      } break;
     case MSG_PED_CMD:
       if (len == sizeof(MsgPedCmd) && h->seq != g_last_cmd_seq) { g_last_cmd_seq = h->seq; g_cmd = ((const MsgPedCmd *)data)->cmd; } break;
     case MSG_E85_STORE:
@@ -233,6 +240,7 @@ static bool dac_write(uint8_t addr, uint16_t mv) {
 static float f_in1 = 0, f_in2 = 0;
 static float assist = 0, learned = 0;
 static bool  active = false;
+static bool  critical = false;   // regime sous le seuil critique
 static uint8_t mode = 1;
 static uint16_t out1 = 0, out2 = 0;
 static float pedal_pct = 0, out_pct = 0;
@@ -251,7 +259,7 @@ static void send_telem() {
   t.mode = mode;
   const bool link = g_link_ms && (millis() - g_link_ms) < LINK_TIMEOUT_MS;
   t.flags = (calibrated ? 1 : 0) | (link ? 2 : 0) | ((dirty_cfg || dirty_cal || dirty_e85) ? 4 : 0)
-          | ((g_dac_ok && g_ads_ok) ? 8 : 0) | (active ? 16 : 0);
+          | ((g_dac_ok && g_ads_ok) ? 8 : 0) | (active ? 16 : 0) | (critical ? 32 : 0);
   t.cal_rel1 = CAL.rel1; t.cal_rel2 = CAL.rel2; t.cal_full1 = CAL.full1; t.cal_full2 = CAL.full2;
   t.e85_rev = E85S.rev; t.fw_build = PROJECT_BUILD;
   t.cfg = CFG;
@@ -395,6 +403,15 @@ void loop() {
   if (target > assist) assist = min(target, assist + 300.0f * dt);
   else                 assist = max(target, assist - 40.0f * dt);
   if (active && assist < minp) assist = minp;
+
+  // --- SEUIL CRITIQUE : sous ce regime, ouverture forcee IMMEDIATE (sans rampe) ---
+  // S'applique pied leve comme pied pose : le calculateur recoit le plus grand des deux.
+  critical = false;
+  if (link && c.assist_en && calibrated && eng && rpm > 0 && !ota_active && c.crit_rpm && rpm < c.crit_rpm) {
+    critical = true;
+    const float cp = c.crit_pct10 / 10.0f;
+    if (assist < cp) assist = cp;
+  }
 
   // --- sorties ---
   const bool in_ok = f_in1 > 100 && f_in1 < 4950 && f_in2 > 50 && f_in2 < 4950;

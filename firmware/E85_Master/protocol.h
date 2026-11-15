@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.1.2"
-#define PROJECT_BUILD   212         // entier croissant (2.1.2 -> 212)
+#define PROJECT_VERSION "2.2.0"
+#define PROJECT_BUILD   220         // entier croissant (2.2.0 -> 220)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2
@@ -85,7 +85,12 @@ struct PedConfig {
   uint16_t kd10;          // anticipation : % par (100 tr/min/s) de chute (x10)
   uint16_t anticip_ms;    // horizon de prediction du regime (ms)
   uint16_t release_pct10; // pedale consideree relachee sous ce seuil (0,1 %)
+  // --- ajoute en 2.2.0 (toujours EN FIN de structure : compatibilite avec les anciennes versions) ---
+  uint16_t crit_rpm;      // seuil critique : sous ce regime, ouverture forcee immediate (0 = desactive)
+  uint16_t crit_pct10;    // ouverture forcee sous le seuil critique (0,1 %)
 };
+// taille de PedConfig avant la 2.2.0 (pour accepter les messages des anciennes versions)
+#define PEDCONFIG_V21_SIZE 24
 
 struct MsgPedConfig { LinkHeader h; PedConfig cfg; };
 struct MsgPedCmd    { LinkHeader h; uint8_t cmd; uint8_t arg; };

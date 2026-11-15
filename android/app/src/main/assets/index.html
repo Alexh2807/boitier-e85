@@ -146,6 +146,9 @@ canvas{width:100%;height:170px;display:block;background:#0d1117;border:1px solid
     <div class="row"><label>Tolérance ±<small>Dans cette plage, l'ouverture apprise ne bouge plus (pas de pompage).</small></label><input type="number" id="tol" min="0" max="500" step="10" data-p="tol"></div>
     <div class="row"><label>S'enclenche sous<small>Pied levé, l'aide prend la main sous ce régime (ou avant, grâce à l'anticipation).</small></label><input type="number" id="eng2" min="500" max="5000" step="50" data-p="eng"></div>
     <div class="row"><label>Se coupe au-dessus<small>Au-delà, l'aide se retire (frein moteur, coupure d'injection en décélération).</small></label><input type="number" id="off" min="800" max="7000" step="50" data-p="off"></div>
+    <h3>Seuil critique</h3>
+    <div class="row"><label>Régime critique<small>Sous ce régime, l'ouverture est forcée <b>immédiatement</b> (pied levé ou posé). 0 = désactivé.</small></label><input type="number" id="crit" min="0" max="3000" step="50" data-p="crit"></div>
+    <div class="row"><label>Ouverture forcée (%)<small>Ouverture minimale appliquée d'un coup sous le régime critique.</small></label><input type="number" id="critp" min="0" max="40" step="0.5" data-p="critp"></div>
     <h3>Ouverture</h3>
     <div class="row"><label>Plancher mini (%)<small>Ouverture minimale tant que l'aide est enclenchée : elle ne retombe jamais en dessous.</small></label><input type="number" id="min" min="0" max="40" step="0.5" data-p="min"></div>
     <div class="row"><label>Maxi (%)</label><input type="number" id="max" min="0" max="60" step="0.5" data-p="max"></div>
@@ -301,9 +304,9 @@ function render(j,t0=0){
     $('c1').textContent=mv(p.cal[0]);$('c2').textContent=mv(p.cal[1]);$('c3').textContent=mv(p.cal[2]);$('c4').textContent=mv(p.cal[3]);
     $('ppV').textContent=fmt(p.pp,1)+' %';$('ppB').style.width=p.pp+'%';
     $('opV').textContent=fmt(p.op,1)+' %';$('opB').style.width=p.op+'%';
-    $('modeV').textContent=L?(MODES[p.mode]||'?'):'Hors ligne';$('apV').textContent=fmt(p.ap,1)+' %';$('lrnV').textContent=fmt(p.lrn,1)+' %';
+    $('modeV').textContent=L?((p.flags&32)?'⚠ Seuil critique':(MODES[p.mode]||'?')):'Hors ligne';$('apV').textContent=fmt(p.ap,1)+' %';$('lrnV').textContent=fmt(p.lrn,1)+' %';
     $('calSt').textContent=(p.flags&1)?'✓ Pédale calibrée':'⚠ Pédale non calibrée : aide au ralenti impossible';
-    const c=p.cfg;['aen','tgt','tol','off','min','max','kp','ki','kd','ant','rel'].forEach(k=>setIn(k,c[k],t0));setIn('eng2',c.eng,t0);
+    const c=p.cfg;['aen','tgt','tol','off','min','max','kp','ki','kd','ant','rel','crit','critp'].forEach(k=>setIn(k,c[k],t0));setIn('eng2',c.eng,t0);
   }
   pushHist(j);draw();
   // versions
