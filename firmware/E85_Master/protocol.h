@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.2.0"
-#define PROJECT_BUILD   220         // entier croissant (2.2.0 -> 220)
+#define PROJECT_VERSION "2.3.0"
+#define PROJECT_BUILD   230         // entier croissant (2.3.0 -> 230)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2
@@ -88,6 +88,8 @@ struct PedConfig {
   // --- ajoute en 2.2.0 (toujours EN FIN de structure : compatibilite avec les anciennes versions) ---
   uint16_t crit_rpm;      // seuil critique : sous ce regime, ouverture forcee immediate (0 = desactive)
   uint16_t crit_pct10;    // ouverture forcee sous le seuil critique (0,1 %)
+  // --- ajoute en 2.3.0 ---
+  uint16_t gmin_pct10;    // ouverture minimale GENERALE de la pedale, avec ou sans aide (0,1 %, 0 = desactive)
 };
 // taille de PedConfig avant la 2.2.0 (pour accepter les messages des anciennes versions)
 #define PEDCONFIG_V21_SIZE 24

@@ -371,13 +371,13 @@ static void send_json() {
       ",\"build\":%u,\"age\":%lu,\"in1\":%u,\"in2\":%u,\"out1\":%u,\"out2\":%u,\"vref\":%u,\"pp\":%.1f,\"op\":%.1f,\"ap\":%.1f,\"lrn\":%.1f,"
       "\"mode\":%u,\"flags\":%u,\"cal\":[%u,%u,%u,%u],"
       "\"cfg\":{\"aen\":%u,\"tgt\":%u,\"tol\":%u,\"eng\":%u,\"off\":%u,\"min\":%.1f,\"max\":%.1f,"
-      "\"kp\":%.1f,\"ki\":%.1f,\"kd\":%.1f,\"ant\":%u,\"rel\":%.1f,\"crit\":%u,\"critp\":%.1f}",
+      "\"kp\":%.1f,\"ki\":%.1f,\"kd\":%.1f,\"ant\":%u,\"rel\":%.1f,\"crit\":%u,\"critp\":%.1f,\"gmin\":%.1f}",
       t.fw_build, (unsigned long)(millis() - tms), t.in1_mv, t.in2_mv, t.out1_mv, t.out2_mv, t.vref_mv,
       t.pedal_pct10 / 10.0f, t.out_pct10 / 10.0f, t.assist_pct10 / 10.0f, t.learned_pct10 / 10.0f, t.mode, t.flags,
       t.cal_rel1, t.cal_rel2, t.cal_full1, t.cal_full2,
       c.assist_en, c.target_rpm, c.tol_rpm, c.engage_rpm, c.off_rpm, c.min_pct10 / 10.0f, c.max_pct10 / 10.0f,
       c.kp10 / 10.0f, c.ki10 / 10.0f, c.kd10 / 10.0f, c.anticip_ms, c.release_pct10 / 10.0f,
-      c.crit_rpm, c.crit_pct10 / 10.0f);
+      c.crit_rpm, c.crit_pct10 / 10.0f, c.gmin_pct10 / 10.0f);
   }
   n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"pota\":{\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
                 g_ped_pending, (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
@@ -443,6 +443,7 @@ static void h_ped() {
   if (server.hasArg("ant"))  c.anticip_ms    = constrain(server.arg("ant").toInt(), 0, 2000);
   if (server.hasArg("crit")) c.crit_rpm      = constrain(server.arg("crit").toInt(), 0, 3000);
   if (server.hasArg("critp"))c.crit_pct10    = constrain(lroundf(argf("critp", 0) * 10), 0, 400);
+  if (server.hasArg("gmin")) c.gmin_pct10    = constrain(lroundf(argf("gmin", 0) * 10), 0, 150);
   if (server.hasArg("rel"))  c.release_pct10 = constrain(lroundf(argf("rel", 3) * 10), 5, 200);
   g_ped_des = c; g_ped_pending = true; g_ped_pending_ms = millis();
   send_ped_cfg(c);

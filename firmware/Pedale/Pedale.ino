@@ -52,7 +52,8 @@ struct Cal { uint16_t rel1, rel2, full1, full2; };
 static const PedConfig CFG_DEFAULT = {
   /*assist_en*/ 0, 0, /*target*/ 950, /*tol*/ 50, /*engage*/ 1300, /*off*/ 2500,
   /*min*/ 0, /*max*/ 150, /*kp*/ 20, /*ki*/ 10, /*kd*/ 5, /*anticip*/ 300, /*release*/ 30,
-  /*crit_rpm*/ 0, /*crit_pct*/ 0          // seuil critique desactive par defaut
+  /*crit_rpm*/ 0, /*crit_pct*/ 0,         // seuil critique desactive par defaut
+  /*gmin*/ 0                              // ouverture minimale generale desactivee par defaut
 };
 static const Cal CAL_DEFAULT = { 396, 186, 3793, 1888 };   // releve sur le firmware d'origine
 
@@ -71,7 +72,7 @@ static void load_all() {
   prefs.begin("ped3", true);
   const size_t cl = prefs.getBytesLength("cfg");
   if (cl == sizeof(PedConfig)) prefs.getBytes("cfg", &CFG, sizeof(PedConfig));
-  else if (cl == PEDCONFIG_V21_SIZE) { prefs.getBytes("cfg", &CFG, PEDCONFIG_V21_SIZE); dirty_cfg = 1; }  // reglages 2.1 conserves
+  else if (cl >= PEDCONFIG_V21_SIZE && cl < sizeof(PedConfig)) { prefs.getBytes("cfg", &CFG, cl); dirty_cfg = 1; }  // reglages d'une version precedente conserves
   bool have_cal = prefs.getBytesLength("cal") == sizeof(Cal);
   if (have_cal) prefs.getBytes("cal", &CAL, sizeof(Cal));
   if (prefs.getBytesLength("e85") == sizeof(E85Settings)) prefs.getBytes("e85", &E85S, sizeof(E85Settings));
@@ -413,18 +414,23 @@ void loop() {
     if (assist < cp) assist = cp;
   }
 
+  // --- OUVERTURE MINIMALE GENERALE : la pedale ne descend jamais sous gmin, avec ou sans aide ---
+  // (garde l'injection active en deceleration -> le regime reste mesurable)
+  const float gmin = calibrated ? c.gmin_pct10 / 10.0f : 0.0f;
+  const float synth = max(assist, gmin);             // ouverture synthetisee demandee
+
   // --- sorties ---
   const bool in_ok = f_in1 > 100 && f_in1 < 4950 && f_in2 > 50 && f_in2 < 4950;
   if (!g_ads_ok || !in_ok)                          mode = 3;
-  else if (assist > 0.05f && assist > pedal_pct)    mode = 2;
+  else if (synth > 0.05f && synth > pedal_pct)      mode = 2;
   else                                              mode = 1;
 
   if (mode == 3) {
     out_pct = 0; out1 = CAL.rel1; out2 = CAL.rel2;
   } else if (mode == 2) {
-    out_pct = assist;
-    out1 = CAL.rel1 + (int)(((int)CAL.full1 - (int)CAL.rel1) * assist / 100.0f);
-    out2 = CAL.rel2 + (int)(((int)CAL.full2 - (int)CAL.rel2) * assist / 100.0f);
+    out_pct = synth;
+    out1 = CAL.rel1 + (int)(((int)CAL.full1 - (int)CAL.rel1) * synth / 100.0f);
+    out2 = CAL.rel2 + (int)(((int)CAL.full2 - (int)CAL.rel2) * synth / 100.0f);
   } else {
     out_pct = pedal_pct;
     out1 = (uint16_t)f_in1; out2 = (uint16_t)f_in2;
