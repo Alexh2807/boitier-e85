@@ -194,7 +194,11 @@ canvas{width:100%;height:170px;display:block;background:#0d1117;border:1px solid
       <tr><td>Boîtier pédale</td><td id="vPed">–</td></tr>
     </tbody></table>
     <div id="updBox"></div>
-    <p class="muted">L'appli contient le firmware E85, qui contient lui-même celui de la pédale : mettre à jour le boîtier E85 suffit, il met ensuite la pédale à jour tout seul (moteur arrêté).</p>
+    <details style="margin-top:10px"><summary class="muted">Secours : la pédale n'est pas joignable</summary>
+      <p class="muted">La pédale (v2.5 et plus) a son propre Wi-Fi « BoitierPedale ». L'appli peut s'y connecter et la mettre à jour directement, sans passer par le boîtier E85.</p>
+      <button onclick="pedDirect()">Mise à jour directe de la pédale (Wi-Fi)</button>
+    </details>
+    <p class="muted">L'appli contient le firmware E85, qui contient lui-même celui de la pédale : mettre à jour le boîtier E85 suffit, il met ensuite la pédale à jour tout seul. Tout peut se lancer moteur tournant : la pédale redémarre au prochain pied levé, le boîtier E85 s'installe à l'arrêt du moteur. En cas d'échec, l'ancienne version reste en place.</p>
   </div>
   <div class="card">
     <h2>Sauvegarde</h2>
@@ -309,7 +313,7 @@ function render(j,t0=0){
     if(!r.n)d='Aucun message ESP-NOW reçu depuis le démarrage du boîtier E85 : la pédale ne tourne pas (alimentation ?) ou ne capte pas.';
     else if(r.age>3000)d=`Dernier message reçu il y a ${Math.round(r.age/1000)} s : la pédale s'est arrêtée ou ne capte plus.`;
     else d=`La pédale parle mais n'est pas comprise (type ${r.type}, version ${r.ver}, ${r.len} octets au lieu de ${r.exp}) : une mise à jour forcée devrait corriger.`;
-    const html=`Boîtier pédale non détecté (ESP-NOW).<br><small>${d}</small><br><br><button onclick="forcePed()">Forcer la mise à jour de la pédale</button>`;
+    const html=`Boîtier pédale non détecté (ESP-NOW).<br><small>${d}</small><br><br><div class="grid2"><button onclick="forcePed()">Forcer via le boîtier E85</button><button onclick="pedDirect()">Mise à jour directe (Wi-Fi pédale)</button></div>`;
     if($('pedOff').innerHTML!==html)$('pedOff').innerHTML=html}
   $('rateV').textContent=(j.rate>0?'+':'')+j.rate+' tr/min/s';
   if(p.in1!==undefined){
@@ -333,6 +337,13 @@ function render(j,t0=0){
     `<br>Reçus par le boîtier E85 : ${rx.n||0} message(s)${rx.n?`, dernier il y a ${fmt((rx.age||0)/1000,1)} s`:''}`;
   if(p.txok!==undefined)radio+=`<br>Pédale → boîtier E85 : ${p.direct?'direct':'diffusion'} · ${p.txok} acquittés, ${p.txfail} perdus`+
     `<br>Pédale : en marche depuis ${Math.floor(p.pup/60)} min, dernier redémarrage : ${RST[p.prst]||p.prst}`;
+  const dg=j.diag||{};
+  if(dg.cnt){const c=dg.cnt,lab=[[1,'mises sous tension'],[9,'chutes d\'alimentation'],[4,'plantages'],[6,'blocages (chien de garde)'],[5,'blocages interruptions'],[7,'chien de garde'],[3,'redémarrages logiciels']];
+    radio+=`<br><br><b>Historique du boîtier E85</b><br>`+lab.filter(([i])=>c[i]).map(([i,t])=>`${c[i]} ${t}`).join(' · ');
+    if(dg.last){const l=dg.last;const st=['?','attente réseau','traitement'][l.stage]||l.stage;
+      radio+=`<br>Dernier incident : <b>${RST[l.r]||l.r}</b> après ${Math.floor(l.up/60)} min ${l.up%60} s`+
+        `${l.hang?' (tâche réseau bloquée)':''} · régime ${l.rpm} · ${l.cl} téléphone(s) · mémoire mini ${Math.round(l.heap/1024)} Ko`+
+        `${l.pst==1?` · mise à jour pédale en cours (${Math.round(l.pdone/1024)} Ko)`:''}`}}
   $('info').innerHTML=`En marche depuis ${Math.floor(j.up/60)} min · dernier redémarrage : ${RST[j.rst]||j.rst}<br>Mémoire libre : ${Math.round(j.heap/1024)} Ko · révision réglages : ${j.rev}`+radio;
 }
 function bind2(id){document.querySelectorAll('#'+id+' [data-k]').forEach(e=>{
@@ -356,7 +367,13 @@ function updUI(j){
   else if(po.st==3&&!pd.link)h=`<p style="color:var(--bad)">Échec de la mise à jour pédale (étape ${po.err}) : elle n'a pas répondu.</p><button onclick="forcePed()">Réessayer (forcer)</button>`;
   else if(po.st==3&&pedOld)h=`<p style="color:var(--bad)">Échec de la mise à jour pédale (étape ${po.err}).</p><button onclick="pedUpd()">Réessayer</button>`;
   else if(pedOld&&pd.link)h=`<button onclick="pedUpd()">Mettre à jour la pédale maintenant</button>`;
-  if(FW&&!uploading){
+  // mise a jour du boitier E85 en deux temps (telechargee, puis installee a l'arret du moteur)
+  const eu=j.e85u||{};
+  if(eu.st==2){h=`<p style="color:var(--acc)">✓ Mise à jour du boîtier E85 téléchargée. Elle s'installera toute seule à l'arrêt du moteur : laisse ensuite le contact mis environ 30 s.</p>`+h;bn='Mise à jour E85 prête : installation à l\'arrêt du moteur'}
+  else if(eu.st==3){const pc=eu.size?Math.round(100*eu.done/eu.size):0;h=`<p>Installation du boîtier E85 : ${pc} % — ne coupe pas le contact.</p><div class="prog"><i style="width:${pc}%"></i></div>`+h;bn='Installation du boîtier E85 : '+pc+' % — ne coupe pas le contact'}
+  else if(eu.st==4){h='<p style="color:var(--ok)">✓ Installé et vérifié, redémarrage du boîtier…</p>'+h}
+  else if(eu.st==5){h=`<p style="color:var(--bad)">Mise à jour du boîtier E85 refusée : ${eu.err||'erreur'}. L'ancienne version continue de fonctionner.</p>`+h}
+  if(FW&&!uploading&&eu.st!=2&&eu.st!=3&&eu.st!=4){
     if(FW.build>j.build){bn=bn||`Nouvelle version du boîtier E85 disponible : v${FW.version}`;
       h=`<button class="pri" style="width:100%" onclick="flashE85()">Mettre à jour le boîtier E85 → v${FW.version}</button>`+h}
     else if(FW.build<j.build)h+=`<p class="muted">Le boîtier a une version plus récente que l'appli : mets l'appli à jour.</p>`;
@@ -373,22 +390,48 @@ function forcePed(){
   api('/api/pedota',{force:1}).then(()=>{tab(3);toast('Mise à jour forcée lancée')}).catch(()=>toast('Envoi impossible'))}
 function loadFw(){const x=new XMLHttpRequest();x.open('GET','firmware.json');x.onload=()=>{try{FW=JSON.parse(x.responseText)}catch(e){}};x.send()}
 function flashE85(){
-  if(!S)return;if(S.on){toast('Arrête le moteur avant la mise à jour');return}
-  if(!confirm('Mettre à jour le boîtier E85 en v'+FW.version+' ?\nNe coupe pas le contact pendant 1 minute.'))return;
+  if(!S)return;
+  const msg=S.on
+    ?'Télécharger la mise à jour du boîtier E85 (v'+FW.version+') moteur tournant ?\n\nL\'injection n\'est pas touchée : la mise à jour est gardée en mémoire et s\'installe toute seule à l\'arrêt du moteur (laisse le contact mis ~30 s).'
+    :'Mettre à jour le boîtier E85 en v'+FW.version+' ?\n\nNe coupe pas le contact pendant environ 1 minute.\nEn cas d\'échec, l\'ancienne version reste en place.';
+  if(!confirm(msg))return;
   uploading=true;const b=$('updBox');b.innerHTML='<p>Lecture du firmware…</p><div class="prog"><i id="upP"></i></div>';
   const x=new XMLHttpRequest();x.open('GET','e85.bin');x.responseType='arraybuffer';
   x.onload=()=>{const fd=new FormData();fd.append('fw',new Blob([x.response]),'e85.bin');
-    const u=new XMLHttpRequest();u.open('POST',BASE+'/api/ota');u.timeout=180000;
+    const u=new XMLHttpRequest();u.open('POST',BASE+'/api/ota');u.timeout=240000;
     u.upload.onprogress=e=>{if(e.lengthComputable){const pc=Math.round(100*e.loaded/e.total);$('upP').style.width=pc+'%';b.firstChild.textContent='Envoi au boîtier : '+pc+' %'}};
     u.onload=()=>{let j={};try{j=JSON.parse(u.responseText)}catch(e){}
-      if(u.status==200){b.innerHTML='<p style="color:var(--ok)">✓ Boîtier E85 mis à jour, redémarrage… La pédale sera mise à jour juste après.</p>';setTimeout(()=>{uploading=false},15000)}
-      else{b.innerHTML='<p style="color:var(--bad)">Échec : '+(j.err||u.status)+'</p>';uploading=false}};
-    u.onerror=u.ontimeout=()=>{b.innerHTML='<p style="color:var(--bad)">Échec de l\'envoi. Réessaie près du boîtier.</p>';uploading=false};
+      uploading=false;
+      if(u.status==200)toast(j.pending?'Téléchargé : installation à l\'arrêt du moteur':'Téléchargé : installation en cours');
+      else b.innerHTML='<p style="color:var(--bad)">Échec : '+(j.err||u.status)+'. L\'ancienne version continue de fonctionner.</p>'};
+    u.onerror=u.ontimeout=()=>{b.innerHTML='<p style="color:var(--bad)">Échec de l\'envoi. Réessaie près du boîtier. Rien n\'a été modifié.</p>';uploading=false};
     u.send(fd)};
   x.onerror=()=>{b.innerHTML='<p style="color:var(--bad)">Firmware introuvable dans l\'appli.</p>';uploading=false};
   x.send();
 }
 
+// ---------- mise a jour DIRECTE de la pedale par son Wi-Fi de secours "BoitierPedale" ----------
+async function pedDirect(){
+  if(!APP){toast('Disponible dans l\'appli Android');return}
+  if(!confirm('Mise à jour directe de la pédale ?\n\nLe téléphone va se connecter au Wi-Fi « BoitierPedale », envoyer le firmware, puis revenir sur le boîtier E85.\nLa pédale continue de fonctionner et redémarre seulement pied levé.'))return;
+  uploading=true;const b=$('updBox');const say=t=>b.innerHTML='<p>'+t+'</p><div class="prog"><i id="upP"></i></div>';
+  say('Connexion au Wi-Fi BoitierPedale…');
+  Android.connect('BoitierPedale',lsGet('pass','ethanol123'));
+  let ok=false;
+  for(let k=0;k<40&&!ok;k++){await new Promise(r=>setTimeout(r,1000));
+    try{const c=new AbortController();setTimeout(()=>c.abort(),1500);const r=await fetch('http://192.168.4.1/api/status',{signal:c.signal,cache:'no-store'});const s=await r.json();ok=s.dev==='pedale'}catch(e){}}
+  const back=()=>{uploading=false;reconnect()};
+  if(!ok){b.innerHTML='<p style="color:var(--bad)">Wi-Fi BoitierPedale introuvable (pédale en v2.5 minimum, alimentée ?).</p>';back();return}
+  say('Envoi du firmware à la pédale…');
+  const x=new XMLHttpRequest();x.open('GET','pedal.bin');x.responseType='arraybuffer';
+  x.onload=()=>{const fd=new FormData();fd.append('fw',new Blob([x.response]),'pedal.bin');
+    const u=new XMLHttpRequest();u.open('POST','http://192.168.4.1/update');u.timeout=180000;
+    u.upload.onprogress=e=>{if(e.lengthComputable){const pc=Math.round(100*e.loaded/e.total);$('upP').style.width=pc+'%';b.firstChild.textContent='Envoi à la pédale : '+pc+' %'}};
+    u.onload=()=>{b.innerHTML=u.status==200?'<p style="color:var(--ok)">✓ Pédale mise à jour et vérifiée. Elle redémarre au prochain pied levé. Retour au boîtier E85…</p>':'<p style="color:var(--bad)">Échec de la mise à jour directe. La pédale garde sa version.</p>';back()};
+    u.onerror=u.ontimeout=()=>{b.innerHTML='<p style="color:var(--bad)">Envoi interrompu. La pédale garde sa version.</p>';back()};
+    u.send(fd)};
+  x.send();
+}
 // ---------- appli (Android) ----------
 function appUpdate(){if(!APP)return;let i={};try{i=JSON.parse(Android.updateInfo())}catch(e){}
   $('vApp').textContent='v'+(i.current||'?')+(i.latest&&i.newer?' → v'+i.latest+' disponible':(i.checked?' ✓ à jour':''));

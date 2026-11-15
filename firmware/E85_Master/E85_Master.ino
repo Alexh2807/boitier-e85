@@ -39,9 +39,15 @@
 #include <soc/soc.h>
 #include <driver/gpio.h>
 #include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_heap_caps.h>
+#include <esp_attr.h>
+
 #include "protocol.h"
 #include "web_ui.h"
 #include "pedal_fw.h"        // firmware du boitier pedale (genere par tools/build_all.ps1)
+// Retour arriere automatique : un nouveau programme demarre "a l'essai" et ne se valide
+// qu'apres 20 s de bon fonctionnement (voir comm_task). Plantage avant -> ancienne version.
 
 // ------------------------------ CONFIG -------------------------------
 static const char *AP_SSID = "BoitierE85";
@@ -269,6 +275,7 @@ static volatile bool g_restore_new = false;
 static PedConfig g_ped_des;
 enum { POTA_IDLE = 0, POTA_RUN = 1, POTA_OK = 2, POTA_FAIL = 3, POTA_SENT = 4 };   // SENT = envoye a l'aveugle, sans confirmation
 static volatile bool     g_pota_blind = false;
+static volatile uint32_t g_pota_end_ms = 0;
 static volatile int      g_pota_state = POTA_IDLE;
 static volatile uint32_t g_pota_done = 0;
 static volatile uint8_t  g_pota_err = 0;
@@ -370,12 +377,14 @@ static bool ped_link() { return g_telem_valid && (millis() - g_telem_ms) < 600; 
 
 // ============================== WEB / API ==============================
 static WebServer server(80);
-static char jbuf[3072];
+static char jbuf[4096];
 
 static void cors() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Cache-Control", "no-store");
 }
+
+static int json_extra(char *b, size_t sz);   // defini plus bas (mise a jour E85 + incidents)
 
 static void send_json() {
   MsgPedTelem t; uint32_t tms; bool tv;
@@ -416,9 +425,10 @@ static void send_json() {
   }
   if (tv) n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"txok\":%u,\"txfail\":%u,\"prst\":%u,\"direct\":%u,\"pup\":%lu",
                         t.tx_ok, t.tx_fail, t.rst, t.unicast, (unsigned long)t.up_s);
-  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"etx\":{\"ok\":%lu,\"fail\":%lu,\"direct\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},\"pota\":{",
+  n += snprintf(jbuf + n, sizeof(jbuf) - n, ",\"pend\":%d},\"etx\":{\"ok\":%lu,\"fail\":%lu,\"direct\":%d},\"rx\":{\"n\":%lu,\"age\":%lu,\"len\":%d,\"type\":%u,\"ver\":%u,\"magic\":%u,\"exp\":%u},",
                 g_ped_pending, (unsigned long)g_tx_ok, (unsigned long)g_tx_fail, (int)g_ped_peer, (unsigned long)g_rx_n, (unsigned long)(g_rx_ms ? millis() - g_rx_ms : 0), g_rx_len,
                 g_rx_type, g_rx_ver, g_rx_magic, (unsigned)sizeof(MsgPedTelem));
+  n += json_extra(jbuf + n, sizeof(jbuf) - n);            // mise a jour E85 + journal d'incidents
   n += snprintf(jbuf + n, sizeof(jbuf) - n, "\"blind\":%d,\"st\":%d,\"done\":%lu,\"size\":%lu,\"err\":%u}}",
                 (int)g_pota_blind, (int)g_pota_state, (unsigned long)g_pota_done, (unsigned long)PEDAL_FW_SIZE, g_pota_err);
   cors();
@@ -558,6 +568,7 @@ static void pota_task(void *) {
   do {
     MsgOtaBegin b = {}; fill_hdr(b.h, MSG_OTA_BEGIN); b.size = PEDAL_FW_SIZE; b.build = PROJECT_BUILD;
     if (!pota_xfer(&b, sizeof(b), 1, 800, 4)) { pota_blind(0); result = POTA_SENT; break; }   // aucune reponse
+    if (g_ack_status == OTA_SAME) { result = POTA_OK; break; }       // deja a jour : rien a envoyer
     if (g_ack_status != OTA_OK) { g_pota_err = 1; break; }
     uint32_t off = 0; int fails = 0; bool blind = false;
     while (off < PEDAL_FW_SIZE) {
@@ -578,6 +589,8 @@ static void pota_task(void *) {
     if (g_ack_status != OTA_OK) { g_pota_err = 3; break; }
     result = POTA_OK;
   } while (0);
+  if (result != POTA_FAIL && g_ack_status == OTA_SAME) Serial.println("[PED-OTA] la pedale etait deja a jour");
+  g_pota_end_ms = millis();                // les decisions suivantes attendront un message NEUF de la pedale
   g_pota_state = result;
   Serial.printf("[PED-OTA] %s (err=%u)\n", result == POTA_OK ? "succes" : result == POTA_SENT ? "envoye sans confirmation" : "ECHEC", g_pota_err);
   vTaskDelete(nullptr);
@@ -599,35 +612,75 @@ static void h_pedota() {
 }
 
 // ===================== MISE A JOUR DU BOITIER E85 (depuis l'appli) =====================
-static bool g_e85_ota_ok = false;
+// En DEUX TEMPS, pour pouvoir la lancer moteur tournant sans jamais toucher a l'injection :
+//  1. reception du firmware dans la PSRAM (RAM externe) : aucune ecriture flash ;
+//  2. installation en flash des que le moteur est arrete depuis 3 s (contact mis ~20 s).
+//     Si le moteur redemarre pendant l'installation, elle se met en pause et reprend.
+// Securite : ecriture dans l'emplacement libre, empreinte verifiee avant de basculer,
+// et le nouveau programme doit prouver qu'il fonctionne (sinon retour automatique a l'ancien).
+enum { E85U_NONE = 0, E85U_RX = 1, E85U_READY = 2, E85U_INSTALL = 3, E85U_DONE = 4, E85U_FAIL = 5 };
+static volatile int    g_e85u = E85U_NONE;
+static volatile size_t g_e85u_done = 0;
+static uint8_t *g_fw_buf = nullptr;
+static size_t   g_fw_len = 0;
+static const size_t FW_MAX = 0x300000;        // taille d'un emplacement programme (3 Mo)
+static String   g_e85u_err;
+
 static void h_ota_upload() {
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
-    g_e85_ota_ok = false;
-    if (g_engine_on || g_pota_state == POTA_RUN) return;   // refuse (reponse dans h_ota_done)
-    rt_enabled = 0;                                          // plus aucun prolongement
-    g_e85_ota = true;
-    Serial.printf("[OTA] debut reception %s\n", up.filename.c_str());
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial); g_e85_ota = false; }
+    g_e85u_err = "";
+    if (g_pota_state == POTA_RUN || g_e85u == E85U_INSTALL) { g_e85u_err = "Une mise a jour est deja en cours"; return; }
+    if (!g_fw_buf) g_fw_buf = (uint8_t *)heap_caps_malloc(FW_MAX, MALLOC_CAP_SPIRAM);
+    if (!g_fw_buf) { g_e85u_err = "PSRAM indisponible"; return; }
+    g_fw_len = 0; g_e85u = E85U_RX; g_e85u_done = 0; g_e85_ota = true;
+    Serial.printf("[OTA] reception en PSRAM : %s\n", up.filename.c_str());
   } else if (up.status == UPLOAD_FILE_WRITE) {
-    if (g_e85_ota && Update.write(up.buf, up.currentSize) != up.currentSize) { Update.printError(Serial); Update.abort(); g_e85_ota = false; }
+    if (g_e85u != E85U_RX) return;
+    if (g_fw_len + up.currentSize > FW_MAX) { g_e85u_err = "Fichier trop gros"; g_e85u = E85U_FAIL; return; }
+    memcpy(g_fw_buf + g_fw_len, up.buf, up.currentSize);
+    if (((g_fw_len + up.currentSize) >> 15) != (g_fw_len >> 15)) vTaskDelay(1);   // laisse respirer le coeur 0 tous les 32 Ko
+    g_fw_len += up.currentSize;
   } else if (up.status == UPLOAD_FILE_END) {
-    if (g_e85_ota && Update.end(true)) { g_e85_ota_ok = true; Serial.printf("[OTA] succes : %u octets\n", up.totalSize); }
-    else { Update.printError(Serial); }
-    g_e85_ota = false;
+    if (g_e85u != E85U_RX) return;
+    // controle immediat de l'image (en-tete ESP32-S3) ; l'empreinte complete est verifiee a l'installation
+    if (g_fw_len < 100000 || g_fw_buf[0] != 0xE9) { g_e85u_err = "Fichier invalide"; g_e85u = E85U_FAIL; g_e85_ota = false; return; }
+    g_e85u = E85U_READY; g_e85_ota = false;
+    Serial.printf("[OTA] %u octets recus, installation a l'arret du moteur\n", (unsigned)g_fw_len);
   } else if (up.status == UPLOAD_FILE_ABORTED) {
-    Update.abort(); g_e85_ota = false;
+    g_e85u = E85U_NONE; g_e85_ota = false;
   }
 }
 static void h_ota_done() {
   cors();
-  if (g_engine_on) { server.send(409, "application/json", "{\"err\":\"Arrete le moteur avant la mise a jour\"}"); apply_settings(); return; }
-  if (!g_e85_ota_ok) { server.send(500, "application/json", "{\"err\":\"Mise a jour refusee ou fichier invalide\"}"); apply_settings(); return; }
-  server.send(200, "application/json", "{\"ok\":1}");
-  delay(500);
-  ESP.restart();
+  if (g_e85u != E85U_READY) {
+    String e = g_e85u_err.length() ? g_e85u_err : String("Reception incomplete");
+    server.send(500, "application/json", "{\"err\":\"" + e + "\"}");
+    if (g_e85u != E85U_INSTALL) g_e85u = E85U_NONE;
+    return;
+  }
+  server.send(200, "application/json", g_engine_on ? "{\"ok\":1,\"pending\":1}" : "{\"ok\":1,\"pending\":0}");
 }
 
+// appele a chaque tour de la tache reseau : installe par blocs de 4 Ko, seulement moteur arrete
+static void e85u_step(uint32_t ms) {
+  if (g_e85u != E85U_READY && g_e85u != E85U_INSTALL) return;
+  const bool safe = !g_engine_on && !rt_sim && ms - g_engine_off_since > 3000;
+  if (!safe) return;                                     // moteur tournant : on attend (ou on met en pause)
+  if (g_e85u == E85U_READY) {
+    if (!Update.begin(g_fw_len)) { g_e85u_err = Update.errorString(); g_e85u = E85U_FAIL; return; }
+    g_e85u = E85U_INSTALL; g_e85u_done = 0; g_e85_ota = true;
+    Serial.println("[OTA] installation...");
+  }
+  const size_t n = min<size_t>(4096, g_fw_len - g_e85u_done);
+  if (Update.write(g_fw_buf + g_e85u_done, n) != n) { g_e85u_err = Update.errorString(); Update.abort(); g_e85u = E85U_FAIL; g_e85_ota = false; return; }
+  g_e85u_done += n;
+  if (g_e85u_done >= g_fw_len) {
+    if (!Update.end(true)) { g_e85u_err = Update.errorString(); g_e85u = E85U_FAIL; g_e85_ota = false; return; }
+    g_e85u = E85U_DONE;
+    Serial.println("[OTA] installe et verifie -> redemarrage");
+  }
+}
 // ============================ MOT DE PASSE WI-FI ============================
 static void h_wifi() {
   cors();
@@ -640,12 +693,82 @@ static void h_wifi() {
   AP_PASS = p; start_ap(); start_espnow();
 }
 
+// ============================ DIAGNOSTIC ============================
+// "Fil d'Ariane" en RAM RTC : survit a tout redemarrage logiciel, plantage, chien de garde
+// ou chute d'alimentation (pas a une coupure de courant). Au demarrage suivant, il est
+// recopie en flash -> l'appli montre l'etat exact du boitier juste avant l'incident.
+#define CRUMB_MAGIC 0xC0FFEE85u
+struct Crumb {
+  uint32_t magic, up_s, heap_min, stage, clients, rx_n, tx_fail, pota_state, pota_done, rpm, hang;
+};
+RTC_NOINIT_ATTR static Crumb g_crumb;
+struct DiagStore { uint16_t cnt[12]; uint8_t last_reason; uint8_t has_last; Crumb last; };
+static DiagStore g_diag;
+static volatile uint32_t g_comm_beat = 0;      // derniere iteration de la tache reseau
+
+// appele dans setup(), AVANT le demarrage du temps reel (ecriture flash autorisee)
+static void diag_boot() {
+  memset(&g_diag, 0, sizeof(g_diag));
+  prefs.begin("diag", false);
+  if (prefs.getBytesLength("d") == sizeof(DiagStore)) prefs.getBytes("d", &g_diag, sizeof(DiagStore));
+  const int r = (int)esp_reset_reason();
+  if (r >= 0 && r < 12) g_diag.cnt[r]++;
+  if (g_crumb.magic == CRUMB_MAGIC && r != ESP_RST_POWERON) {
+    g_diag.last = g_crumb; g_diag.last_reason = (uint8_t)r; g_diag.has_last = 1;
+  }
+  prefs.putBytes("d", &g_diag, sizeof(DiagStore));
+  prefs.end();
+  memset(&g_crumb, 0, sizeof(g_crumb));
+  g_crumb.magic = CRUMB_MAGIC;
+}
+
+// Surveillance : si la tache reseau ne tourne plus depuis 6 s, le Wi-Fi est bloque.
+// Moteur arrete -> redemarrage immediat. Moteur tournant -> on attend l'arret
+// (un redemarrage couperait l'injection ; le coeur temps reel, lui, continue).
+static void monitor_task(void *) {
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    g_crumb.up_s = millis() / 1000;
+    g_crumb.heap_min = esp_get_minimum_free_heap_size();
+    g_crumb.rpm = g_rpm;
+    if (g_comm_beat && millis() - g_comm_beat > 6000) {
+      g_crumb.hang = 1;
+      if (!g_engine_on) {
+        Serial.println("[DIAG] tache reseau bloquee -> redemarrage");
+        delay(50);
+        esp_restart();
+      }
+    }
+  }
+}
+
+// morceau de JSON : etat de la mise a jour E85 + journal d'incidents, termine par "pota":{
+static int json_extra(char *b, size_t sz) {
+  int n = snprintf(b, sz, "\"e85u\":{\"st\":%d,\"done\":%u,\"size\":%u,\"err\":\"%s\",\"psram\":%u},",
+                   (int)g_e85u, (unsigned)g_e85u_done, (unsigned)g_fw_len, g_e85u_err.c_str(),
+                   (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024));
+  n += snprintf(b + n, sz - n, "\"diag\":{\"cnt\":[");
+  for (int i = 0; i < 12; i++) n += snprintf(b + n, sz - n, "%s%u", i ? "," : "", g_diag.cnt[i]);
+  n += snprintf(b + n, sz - n, "]");
+  if (g_diag.has_last) {
+    const Crumb &c = g_diag.last;
+    n += snprintf(b + n, sz - n, ",\"last\":{\"r\":%u,\"up\":%lu,\"stage\":%lu,\"heap\":%lu,\"cl\":%lu,\"rx\":%lu,\"txf\":%lu,\"pst\":%lu,\"pdone\":%lu,\"rpm\":%lu,\"hang\":%lu}",
+                  g_diag.last_reason, (unsigned long)c.up_s, (unsigned long)c.stage, (unsigned long)c.heap_min, (unsigned long)c.clients,
+                  (unsigned long)c.rx_n, (unsigned long)c.tx_fail, (unsigned long)c.pota_state, (unsigned long)c.pota_done,
+                  (unsigned long)c.rpm, (unsigned long)c.hang);
+  }
+  n += snprintf(b + n, sz - n, "},\"pota\":{");
+  return n;
+}
+
 // ========================= TACHE COMMUNICATION =========================
 static void start_ap() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS.c_str(), LINK_CHANNEL, 0, 4);
-  WiFi.setTxPower(WIFI_POWER_17dBm);
+  // 13 dBm : largement assez dans une voiture, et chaque emission consomme moins
+  // (les pics de courant du Wi-Fi font chuter une alimentation un peu juste)
+  WiFi.setTxPower(WIFI_POWER_13dBm);
 }
 
 static void start_espnow() {
@@ -662,8 +785,17 @@ static void start_espnow() {
 
 static void comm_task(void *) {
   Serial.begin(115200);
+  // RX du port serie (GPIO44) tire au niveau haut : quand l'USB est debranche, la puce USB n'est
+  // plus alimentee et sa sortie flotte -> sans ca, parasites et interruptions inutiles sur le coeur 0.
+  gpio_pullup_en(GPIO_NUM_44);
   delay(200);
   Serial.printf("\n[BOOT] Boitier E85 v%s - reset=%d - CPU %lu MHz\n", FW_VERSION, (int)esp_reset_reason(), (unsigned long)getCpuFrequencyMhz());
+  Serial.printf("[BOOT] PSRAM %u Ko - incidents : alim=%u plantage=%u chien_de_garde=%u\n",
+                (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024), g_diag.cnt[ESP_RST_BROWNOUT],
+                g_diag.cnt[ESP_RST_PANIC], g_diag.cnt[ESP_RST_TASK_WDT] + g_diag.cnt[ESP_RST_INT_WDT] + g_diag.cnt[ESP_RST_WDT]);
+#ifdef TEST_CRASH   // uniquement pour tester le retour arriere automatique (jamais dans une version publiee)
+  delay(5000); Serial.println("[TEST] plantage volontaire"); abort();
+#endif
   start_ap();
   start_espnow();
   Serial.printf("[WiFi] AP %s  ip=%s  canal=%d\n", AP_SSID, WiFi.softAPIP().toString().c_str(), LINK_CHANNEL);
@@ -683,7 +815,13 @@ static void comm_task(void *) {
 
   uint32_t t_fast = 0, t_cfg = 0, t_log = 0, t_wd = 0;
   for (;;) {
+    g_comm_beat = millis();
+    g_crumb.stage = 1;
     server.handleClient();
+    g_crumb.stage = 2;
+    g_crumb.clients = WiFi.softAPgetStationNum();
+    g_crumb.rx_n = g_rx_n; g_crumb.tx_fail = g_tx_fail;
+    g_crumb.pota_state = g_pota_state; g_crumb.pota_done = g_pota_done;
     const uint32_t ms = millis();
 
     if (ms - t_fast >= 20) {                 // 50 Hz : regime + derivee vers la pedale
@@ -741,11 +879,33 @@ static void comm_task(void *) {
       Serial.printf("[NVS] reglages sauvegardes (rev %lu)\n", (unsigned long)S.rev);
     }
 
+    // --- installation de la mise a jour du boitier E85 (moteur arrete seulement) ---
+    e85u_step(ms);
+    static uint32_t done_ms = 0;
+    if (g_e85u == E85U_DONE) { if (!done_ms) done_ms = ms; else if (ms - done_ms > 1500) ESP.restart(); }
+
+    // --- le nouveau programme se valide lui-meme apres 20 s de bon fonctionnement ---
+    // (s'il plante ou se bloque avant, le demarreur revient tout seul a l'ancienne version)
+    static bool validated = false;
+    if (!validated && ms > 20000 && WiFi.getMode() == WIFI_AP) {
+      validated = true;
+      esp_ota_img_states_t st;
+      if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        Serial.println("[OTA] nouvelle version validee");
+      }
+    }
+
     // --- mise a jour automatique de la pedale si elle n'a pas la meme version ---
-    if (ped_link() && g_pota_state != POTA_RUN && !g_e85_ota && !g_engine_on && !rt_sim
-        && ms - g_engine_off_since > 5000 && g_pota_tries < 3 && (!g_pota_last_try || ms - g_pota_last_try > 30000)) {
+    // Moteur tournant : seulement si la pedale sait attendre le pied leve pour redemarrer (build >= 231).
+    if (ped_link() && g_pota_state != POTA_RUN && !g_e85_ota && g_e85u != E85U_INSTALL && !rt_sim
+        && ms > 15000 && g_pota_tries < 3 && (!g_pota_last_try || ms - g_pota_last_try > 60000)
+        // apres une mise a jour : 30 s de delai ET un message recu APRES le redemarrage de la pedale
+        // (sinon on lirait son dernier message d'avant redemarrage, avec l'ancienne version)
+        && (!g_pota_end_ms || (ms - g_pota_end_ms > 30000 && (int32_t)(g_telem_ms - g_pota_end_ms) > 5000))) {
       uint16_t pb, pp; portENTER_CRITICAL(&g_mux); pb = g_telem.fw_build; pp = g_telem.pedal_pct10; portEXIT_CRITICAL(&g_mux);
-      if (pb && pb != PROJECT_BUILD && pp < 50) {
+      const bool ok_now = !g_engine_on ? (ms - g_engine_off_since > 5000 && pp < 50) : (pb >= 231);
+      if (pb && pb != PROJECT_BUILD && ok_now) {
         Serial.printf("[PED-OTA] pedale en build %u, attendu %d -> mise a jour\n", pb, PROJECT_BUILD);
         pota_start();
       }
@@ -788,6 +948,7 @@ void setup() {
   PERIOD_MAX_T = 1000000UL * TPU;             // 1 s     (< 120 tr/min)
 
   load_settings();                            // flash lue AVANT le demarrage temps reel
+  diag_boot();                                // compteurs d'incidents (ecriture flash, avant le temps reel)
   apply_settings();
 
   for (int i = 0; i < 3; i++) {
@@ -801,6 +962,7 @@ void setup() {
 
   // 2) tout le reseau sur le coeur 0
   xTaskCreatePinnedToCore(comm_task, "comm", 8192, nullptr, 3, nullptr, 0);
+  xTaskCreatePinnedToCore(monitor_task, "mon", 3072, nullptr, 10, nullptr, 0);
 
   // 3) le coeur 1 (loopTask) devient la boucle temps reel - ne revient jamais
   disableCore1WDT();

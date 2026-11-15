@@ -22,12 +22,13 @@ python -I "$root\tools\gen_pedal_fw.py" "$root\build\Pedale\Pedale.ino.bin"
 python -I "$root\tools\gen_web_ui.py"
 
 Write-Host "== 3. Firmware E85 =="
-& $cli compile -b "esp32:esp32:esp32s3:CPUFreq=240,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,LoopCore=1,EventsCore=0,CDCOnBoot=default" --output-dir "$root\build\E85_Master" "$root\firmware\E85_Master"
+& $cli compile -b "esp32:esp32:esp32s3:CPUFreq=240,FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,LoopCore=1,EventsCore=0,CDCOnBoot=default,PSRAM=opi" --output-dir "$root\build\E85_Master" "$root\firmware\E85_Master"
 if ($LASTEXITCODE) { throw "compilation E85" }
 
 Write-Host "== 4. Integration dans l'appli =="
 $assets = "$root\android\app\src\main\assets"
 Copy-Item "$root\build\E85_Master\E85_Master.ino.bin" "$assets\e85.bin" -Force
+Copy-Item "$root\build\Pedale\Pedale.ino.bin" "$assets\pedal.bin" -Force
 "{`"version`":`"$ver`",`"build`":$bld}" | Set-Content -Encoding ascii "$assets\firmware.json"
 
 Write-Host "== 5. APK =="

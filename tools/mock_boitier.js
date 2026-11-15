@@ -6,7 +6,11 @@ const S = { fw: '2.1.0', build: 210, rpm: 0, rate: 0, on: 1, en: 1, pct: 25, tri
   inv: 0, ipc: 1, sim: 0, simrpm: 900, simpw: 3000, sv: 1, rev: 12, up: 0, rst: 1, heap: 210000, cyl: [],
   ped: { link: 1, build: 210, age: 20, in1: 396, in2: 186, out1: 396, out2: 186, vref: 5000, pp: 0, op: 0, ap: 0, lrn: 2, mode: 1, flags: 11,
     cal: [396, 186, 3793, 1888], cfg: { aen: 1, tgt: 1500, tol: 50, eng: 1800, off: 2500, min: 5, max: 15, kp: 1, ki: 1, kd: 0.5, ant: 300, rel: 3 }, pend: 0 },
-  pota: { st: 0, done: 0, size: 886800, err: 0 } };
+  pota: { blind: 0, st: 0, done: 0, size: 960000, err: 0 },
+  e85u: { st: 2, done: 0, size: 1955000, err: '', psram: 8192 },
+  etx: { ok: 1200, fail: 3, direct: 1 }, rx: { n: 5000, age: 40, len: 92, type: 10, ver: 2, magic: 59482, exp: 92 },
+  diag: { cnt: [0, 7, 0, 1, 0, 0, 1, 0, 0, 2, 0, 0], last: { r: 6, up: 732, stage: 1, heap: 181000, cl: 1, rx: 5000, txf: 2, pst: 1, pdone: 300000, rpm: 0, hang: 0 } } };
+Object.assign(S.ped, { txok: 4200, txfail: 0, prst: 1, direct: 1, pup: 3600 });
 const t0 = Date.now(); let rpm = 3000, prev = 3000, ap = 0, lrn = 2, act = false;
 setInterval(() => {                          // petit modele moteur 50 Hz
   const c = S.ped.cfg, t = (Date.now() - t0) / 1000;

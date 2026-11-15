@@ -33,7 +33,12 @@
 #include <esp_wifi.h>
 #include <esp_task_wdt.h>
 #include <esp_ota_ops.h>
+#include <WebServer.h>
+#include <Update.h>
 #include "protocol.h"
+
+#define PED_AP_SSID "BoitierPedale"
+#define PED_AP_PASS "ethanol123"
 
 // ------------------------------ CONFIG -------------------------------
 #define PIN_SDA      8
@@ -200,6 +205,7 @@ static void ota_process(uint32_t ms) {
   if (h->type == MSG_OTA_BEGIN && len == sizeof(MsgOtaBegin)) {
     const MsgOtaBegin *b = (const MsgOtaBegin *)buf;
     if (ota_active && b->size == ota_size) { ota_ack(1, OTA_OK); return; }   // doublon
+    if (!ota_active && b->build == PROJECT_BUILD) { ota_ack(1, OTA_SAME); return; }   // deja a jour : on ne reinstalle pas
     ota_abort();
     ota_part = esp_ota_get_next_update_partition(nullptr);
     if (!ota_part || b->size > ota_part->size ||
@@ -325,11 +331,79 @@ static void handle_cmd(uint8_t c, uint32_t ms) {
   Serial.printf("[CMD] %u -> cal=%d rel=%u/%u full=%u/%u\n", c, calibrated, CAL.rel1, CAL.rel2, CAL.full1, CAL.full2);
 }
 
+// ================= WI-FI DE SECOURS : page web + mise a jour directe =================
+// Tourne sur le coeur 0 ; la boucle pedale (coeur 1) continue pendant la mise a jour.
+static WebServer web(80);
+static bool   g_web_ota_ok = false;
+static String g_web_ota_err;
+
+static void web_cors() { web.sendHeader("Access-Control-Allow-Origin", "*"); web.sendHeader("Cache-Control", "no-store"); }
+static void web_status() {
+  char b[400];
+  const bool link = g_link_ms && (millis() - g_link_ms) < LINK_TIMEOUT_MS;
+  snprintf(b, sizeof(b),
+    "{\"dev\":\"pedale\",\"ver\":\"%s\",\"build\":%d,\"up\":%lu,\"rst\":%d,\"link\":%d,\"in1\":%u,\"in2\":%u,\"out1\":%u,\"out2\":%u,"
+    "\"pp\":%.1f,\"mode\":%u,\"txok\":%u,\"txfail\":%u,\"ota\":%d,\"restart\":%d}",
+    PROJECT_VERSION, PROJECT_BUILD, millis() / 1000, (int)esp_reset_reason(), link, (unsigned)f_in1, (unsigned)f_in2, out1, out2,
+    pedal_pct, mode, g_tx_ok, g_tx_fail, (int)ota_active, (int)ota_restart_pending);
+  web_cors(); web.send(200, "application/json", b);
+}
+static void web_root() {
+  web_cors();
+  web.send(200, "text/html; charset=utf-8",
+    "<!DOCTYPE html><meta name=viewport content='width=device-width'><title>Boitier pedale</title>"
+    "<body style='font-family:system-ui;background:#0d1117;color:#e6edf3;padding:16px'>"
+    "<h2>Boitier pedale v" PROJECT_VERSION "</h2><p id=s>...</p>"
+    "<form method=POST action=/update enctype=multipart/form-data><input type=file name=fw accept=.bin> "
+    "<button>Mettre a jour</button></form>"
+    "<script>fetch('/api/status').then(r=>r.json()).then(j=>s.textContent='build '+j.build+' - liaison E85 : '+(j.link?'oui':'non'))</script>");
+}
+static void web_upload() {
+  HTTPUpload &up = web.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    g_web_ota_ok = false; g_web_ota_err = "";
+    if (ota_active) { g_web_ota_err = "mise a jour ESP-NOW en cours"; return; }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { g_web_ota_err = Update.errorString(); return; }
+    Serial.println("[WEB-OTA] debut");
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_web_ota_err.length() || !Update.isRunning()) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) { g_web_ota_err = Update.errorString(); Update.abort(); }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!g_web_ota_err.length() && Update.isRunning()) {
+      if (Update.end(true)) g_web_ota_ok = true; else g_web_ota_err = Update.errorString();
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (Update.isRunning()) Update.abort();
+    g_web_ota_err = "envoi interrompu";
+  }
+}
+static void web_upload_done() {
+  web_cors();
+  if (g_web_ota_ok) {
+    web.send(200, "application/json", "{\"ok\":1}");
+    ota_restart_pending = true;               // redemarre des que la pedale est relachee
+    Serial.println("[WEB-OTA] succes -> redemarrage au prochain pied leve");
+  } else {
+    web.send(500, "application/json", String("{\"err\":\"") + (g_web_ota_err.length() ? g_web_ota_err : String("echec")) + "\"}");
+  }
+}
+static void web_task(void *) {
+  web.on("/", web_root);
+  web.on("/api/status", web_status);
+  web.on("/update", HTTP_POST, web_upload_done, web_upload);
+  web.onNotFound([]() { web_cors(); web.send(404, "text/plain", "404"); });
+  web.begin();
+  for (;;) { web.handleClient(); vTaskDelay(2); }
+}
+
+// Retour arriere automatique : la nouvelle version ne se valide qu'apres 15 s sans plantage (voir loop)
+
 void setup() {
 #if USE_RELAY
   pinMode(PIN_RELAY, OUTPUT); digitalWrite(PIN_RELAY, LOW);
 #endif
   Serial.begin(115200);
+  gpio_pullup_en(GPIO_NUM_44);             // RX serie au niveau haut quand l'USB est debranche
   delay(100);
   Serial.printf("\n[BOOT] Boitier pedale v%s (build %d) reset=%d\n", PROJECT_VERSION, PROJECT_BUILD, (int)esp_reset_reason());
   load_all();
@@ -350,10 +424,15 @@ void setup() {
   Serial.printf("[I2C] MCP4725 0x61/0x60 %s  ADS1115 0x48 %s\n", g_dac_ok ? "OK" : "ERREUR", g_ads_ok ? "OK" : "ERREUR");
 
   WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
+  // STA (pour l'ESP-NOW) + point d'acces de secours "BoitierPedale" sur le meme canal :
+  // permet de mettre la pedale a jour en direct depuis l'appli si la liaison avec le boitier E85 ne passe pas.
+  WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect();
+  WiFi.softAP(PED_AP_SSID, PED_AP_PASS, LINK_CHANNEL, 0, 2);
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_channel(LINK_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  WiFi.setTxPower(WIFI_POWER_13dBm);       // moins de pics de courant a l'emission
+  xTaskCreatePinnedToCore(web_task, "web", 6144, nullptr, 1, nullptr, 0);
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(on_recv);
     esp_now_register_send_cb(on_sent);
@@ -371,13 +450,27 @@ void setup() {
   esp_task_wdt_init(2, true);
 #endif
   esp_task_wdt_add(NULL);
-  esp_ota_mark_app_valid_cancel_rollback();
+  // (la validation de la nouvelle version se fait dans loop() apres 15 s de bon fonctionnement)
 }
 
 void loop() {
   static uint32_t t_telem = 0, t_log = 0, last_us = micros();
   esp_task_wdt_reset();
   const uint32_t ms = millis();
+
+#ifdef TEST_CRASH   // uniquement pour tester le retour arriere automatique (jamais dans une version publiee)
+  if (ms > 3000) { Serial.println("[TEST] plantage volontaire"); abort(); }
+#endif
+  // nouvelle version validee apres 15 s sans plantage (sinon retour automatique a l'ancienne)
+  static bool validated = false;
+  if (!validated && ms > 15000) {
+    validated = true;
+    esp_ota_img_states_t st;
+    if (esp_ota_get_state_partition(esp_ota_get_running_partition(), &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
+      esp_ota_mark_app_valid_cancel_rollback();
+      Serial.println("[OTA] nouvelle version validee");
+    }
+  }
 
   // --- messages recus ---
   uint8_t cmd; bool cfgn, e85n; PedConfig cfg; E85Settings e85; uint16_t rpm; int16_t rate; uint8_t eng; uint32_t lms;

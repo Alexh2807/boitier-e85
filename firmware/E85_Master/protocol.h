@@ -7,8 +7,8 @@
 #include <stddef.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.4.1"
-#define PROJECT_BUILD   241         // entier croissant (2.4.1 -> 241)
+#define PROJECT_VERSION "2.5.0"
+#define PROJECT_BUILD   250         // entier croissant (2.5.0 -> 250)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2
@@ -29,7 +29,7 @@ enum : uint8_t {
 
 #define OTA_CHUNK 224
 
-enum : uint8_t { OTA_OK = 0, OTA_ERR_BEGIN = 1, OTA_ERR_WRITE = 2, OTA_ERR_VERIFY = 3, OTA_ERR_BUSY = 4 };
+enum : uint8_t { OTA_OK = 0, OTA_ERR_BEGIN = 1, OTA_ERR_WRITE = 2, OTA_ERR_VERIFY = 3, OTA_ERR_BUSY = 4, OTA_SAME = 5 /* deja a jour */ };
 
 enum : uint8_t {
   CMD_CAL_RELEASED = 1, // memoriser tensions pedale relachee

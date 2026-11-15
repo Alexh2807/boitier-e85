@@ -18,3 +18,4 @@ android/build/
 android/app/build/
 .claude/
 page_web_recuperee.html
+android/app/src/main/assets/pedal.bin
