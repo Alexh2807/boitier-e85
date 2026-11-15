@@ -1,4 +1,4 @@
-// =====================================================================
+﻿// =====================================================================
 //  protocol.h  -  Protocole ESP-NOW commun Boitier E85 <-> Boitier Pedale
 //  !! Ce fichier doit etre IDENTIQUE dans E85_Master/ et Pedale/ !!
 // =====================================================================
@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 // Version du projet : E85, pedale et appli sont publies ensemble avec ce numero.
-#define PROJECT_VERSION "2.1.0"
-#define PROJECT_BUILD   210         // entier croissant (2.1.0 -> 210)
+#define PROJECT_VERSION "2.1.1"
+#define PROJECT_BUILD   211         // entier croissant (2.1.1 -> 211)
 
 #define LINK_MAGIC      0xE85Au     // identifiant du reseau (change-le si tu as 2 voitures)
 #define LINK_VERSION    2

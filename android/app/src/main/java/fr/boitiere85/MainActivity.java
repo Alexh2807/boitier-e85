@@ -65,8 +65,27 @@ public class MainActivity extends Activity {
         s.setCacheMode(WebSettings.LOAD_NO_CACHE);
         web.setWebViewClient(new WebViewClient());
         web.addJavascriptInterface(new Bridge(), "Android");
+        WebView.setWebContentsDebuggingEnabled(true);   // diagnostic via adb (chrome://inspect)
         web.loadUrl("file:///android_asset/index.html");
-        setContentView(web);
+        // Android 15 : affichage bord a bord -> on decale sous la barre d'etat et au-dessus de la barre de navigation
+        android.widget.FrameLayout root = new android.widget.FrameLayout(this);
+        root.setBackgroundColor(Color.parseColor("#0d1117"));
+        root.addView(web);
+        root.setOnApplyWindowInsetsListener((v, ins) -> {
+            int top, bottom, left, right;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                android.graphics.Insets b = ins.getInsets(android.view.WindowInsets.Type.systemBars()
+                        | android.view.WindowInsets.Type.displayCutout());
+                top = b.top; bottom = b.bottom; left = b.left; right = b.right;
+            } else {
+                top = ins.getSystemWindowInsetTop(); bottom = ins.getSystemWindowInsetBottom();
+                left = ins.getSystemWindowInsetLeft(); right = ins.getSystemWindowInsetRight();
+            }
+            v.setPadding(left, top, right, bottom);
+            return ins;
+        });
+        setContentView(root);
+        root.requestApplyInsets();
 
         new Thread(this::checkUpdate).start();
     }
