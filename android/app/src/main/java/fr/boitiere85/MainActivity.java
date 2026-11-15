@@ -64,6 +64,7 @@ public class MainActivity extends Activity {
         s.setAllowUniversalAccessFromFileURLs(true);   // file:// -> http://192.168.4.1
         s.setCacheMode(WebSettings.LOAD_NO_CACHE);
         web.setWebViewClient(new WebViewClient());
+        web.setWebChromeClient(new android.webkit.WebChromeClient());   // sinon confirm()/alert() sont refuses d'office
         web.addJavascriptInterface(new Bridge(), "Android");
         WebView.setWebContentsDebuggingEnabled(true);   // diagnostic via adb (chrome://inspect)
         web.loadUrl("file:///android_asset/index.html");
