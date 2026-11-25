@@ -33,6 +33,15 @@ http.createServer((req, res) => {
   const q = u.query;
   if (u.pathname === '/api/set') { for (const k in q) { if (/^t[123]$/.test(k)) S.trim[+k[1] - 1] = +q[k]; else S[k] = +q[k]; } S.rev++; }
   if (u.pathname === '/api/ped') { for (const k in q) S.ped.cfg[k] = +q[k]; }
+  if (u.pathname === '/api/man') {
+    const M = global.M || (global.M = { until: 0, mask: 0, log: [] });
+    if (q.op) M.log.push(q.op);
+    if (q.op === 'hold') { M.until = Date.now() + 600; M.mask = +q.cyl; }
+    if (q.op === 'stop') M.until = 0;
+    const on = Date.now() < M.until ? M.mask : 0;
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    return res.end(JSON.stringify({ on, left: 0, abort: 0, why: '', stuck: 0, rpm: 0, log: M.log, cyl: [0, 1, 2].map(i => ({ in: 0, out: on >> i & 1, n: 0, e: 0 })) }));
+  }
   const t = (Date.now() - t0) / 1000;
   S.up = Math.floor(t);
   const per = 120e6 / Math.max(S.rpm, 300), pw = 2800;

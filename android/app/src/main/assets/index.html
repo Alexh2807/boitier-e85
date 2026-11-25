@@ -224,9 +224,33 @@ canvas{width:100%;height:170px;display:block;background:#0d1117;border:1px solid
   </div>
 </section>
 </main>
+<!-- DIAG -->
+<section class="tab" id="t4">
+<div class="card"><h2>Entrées et sorties</h2>
+  <table><thead><tr><th>Cylindre</th><th>Entrée ECU</th><th>Sortie (gate)</th><th>Impulsions</th><th>Fronts bruts</th></tr></thead><tbody id="dgT"></tbody></table>
+  <p class="muted" id="dgS">–</p>
+  <p class="muted">« Sortie » est le niveau relu sur la broche de l'ESP32, pas l'état du MOSFET. Le drain se vérifie au multimètre : environ 12 V = injecteur fermé, environ 0 V = ouvert.</p>
+</div>
+<div class="card"><h2>Actionner les MOSFET</h2>
+  <div class="warn err"><b>Coupe la pompe à essence avant (relais ou fusible).</b> Pompe en marche, un injecteur ouvert remplit le cylindre. Il reste de la pression dans la rampe : même pompe coupée, un peu d'essence sort. Ne lance pas le démarreur si un cylindre a pu être noyé.</div>
+  <div class="row"><label>Pompe coupée, moteur arrêté<small>À cocher pour activer les commandes</small></label><label class="sw"><input type="checkbox" id="dgArm" onchange="dgUI()"><i></i></label></div>
+  <div class="grid" id="dgSel"></div>
+  <h3>Impulsions (clic de l'injecteur)</h3>
+  <div class="row"><label>Durée<small>1 à 20 ms</small></label><input type="number" id="dgMs" min="1" max="20" value="5"></div>
+  <div class="row"><label>Nombre<small>1 à 20, 5 par seconde</small></label><input type="number" id="dgN" min="1" max="20" value="10"></div>
+  <button class="pri dgc" style="width:100%" onclick="dgPulse()">Envoyer les impulsions</button>
+  <h3>Maintien (mesure au multimètre)</h3>
+  <p class="muted">Ouvert tant que tu appuies, 5 s au maximum. Se ferme si tu relâches, si le Wi-Fi coupe ou si l'ECU envoie un signal.</p>
+  <button class="dng dgc" id="dgHold" style="width:100%;padding:22px;touch-action:none;user-select:none;-webkit-user-select:none">Maintenir pour ouvrir</button>
+  <button style="width:100%;margin-top:10px" onclick="dgStop()">Tout fermer</button>
+  <p id="dgMsg" class="muted" style="min-height:1.4em"></p>
+</div>
+</section>
+
 <nav>
   <button class="on" onclick="tab(0)">Moteur</button><button onclick="tab(1)">Injection</button>
   <button onclick="tab(2)">Pédale</button><button onclick="tab(3)">Système</button>
+  <button onclick="tab(4)">Diag</button>
 </nav>
 <div id="toast"></div>
 <script>
@@ -238,7 +262,7 @@ let FW=null;   // firmware E85 embarque dans l'appli {version,build}
 const MODES=['Bypass','Recopie','Aide active','Défaut (pédale relâchée)'];
 const fmt=(v,d=0)=>Number(v).toFixed(d).replace('.',',');
 function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';clearTimeout(e._t);e._t=setTimeout(()=>e.style.display='none',2500)}
-function tab(i){curTab=i;document.querySelectorAll('.tab').forEach((t,k)=>t.classList.toggle('on',k==i));document.querySelectorAll('nav button').forEach((b,k)=>b.classList.toggle('on',k==i))}
+function tab(i){if(curTab==4&&i!=4){dgStop();$('dgArm').checked=false;dgUI()}curTab=i;document.querySelectorAll('.tab').forEach((t,k)=>t.classList.toggle('on',k==i));document.querySelectorAll('nav button').forEach((b,k)=>b.classList.toggle('on',k==i))}
 
 // ---------- requetes : une reponse partie AVANT une modif de l'utilisateur n'ecrase pas les champs ----------
 async function api(path,q){
@@ -455,5 +479,45 @@ bind();
 $('ssid').value=lsGet('ssid','BoitierE85');$('pass').value=lsGet('pass','ethanol123');
 if(APP){loadFw();reconnect();setInterval(appUpdate,2000);appUpdate()}else{$('vApp').textContent='navigateur'}
 poll();
+
+// ---------- diagnostic : commande manuelle des sorties ----------
+let dgMask=1,dgId=0,dgBusy=false,dgTimer=null;
+async function dgApi(q){
+  const ctl=new AbortController(),to=setTimeout(()=>ctl.abort(),1500);
+  try{const r=await fetch(BASE+'/api/man'+(q?'?'+new URLSearchParams(q):''),{signal:ctl.signal,cache:'no-store'});
+    if(r.status==404){$('dgMsg').textContent='Le boîtier doit être mis à jour (v2.6.0 ou plus) pour cette fonction.';return null}
+    const j=await r.json();dgShow(j);return j}
+  finally{clearTimeout(to)}
+}
+function dgShow(j){
+  $('dgT').innerHTML=j.cyl.map((c,i)=>`<tr><td>Cyl ${i+1}</td><td style="color:${c.in?'var(--acc)':'var(--mut)'}">${c.in?'1':'0'}</td><td style="color:${c.out?'var(--bad)':'var(--ok)'}">${c.out?'OUVERT':'fermé'}</td><td>${c.n}</td><td>${c.e}</td></tr>`).join('');
+  $('dgS').textContent=(j.stuck?`⚠ Entrée restée bloquée à 1 : ${j.stuck} fois, sortie coupée. `:'')+(j.left?`${j.left} impulsion(s) restante(s)`:'');
+  if(j.why)$('dgMsg').textContent=j.why;else if(j.abort)$('dgMsg').textContent='Annulé : signal reçu de l\'ECU.';
+}
+function dgUI(){
+  $('dgSel').innerHTML=[1,2,4].map((m,i)=>`<button class="${dgMask&m?'pri':''}" onclick="dgMask^=${m};dgUI()">Cyl ${i+1}</button>`).join('');
+  document.querySelectorAll('.dgc').forEach(b=>b.disabled=!$('dgArm').checked||!dgMask);
+}
+function dgPulse(){$('dgMsg').textContent='';dgApi({op:'pulse',cyl:dgMask,ms:$('dgMs').value,n:$('dgN').value}).catch(()=>$('dgMsg').textContent='Envoi impossible')}
+function dgStop(){const id=dgId||0;dgEnd();return dgApi({op:'stop',id}).catch(()=>$('dgMsg').textContent='Arrêt non confirmé : le boîtier ferme seul en moins de 0,6 s.')}
+function dgEnd(){clearInterval(dgTimer);dgTimer=null;$('dgHold').textContent='Maintenir pour ouvrir'}
+async function dgRenew(id){
+  if(dgBusy||!dgTimer||id!=dgId)return;dgBusy=true;
+  try{const j=await dgApi({op:'hold',cyl:dgMask,id});if(!j||j.why)dgEnd()}
+  catch(e){dgEnd();$('dgMsg').textContent='Connexion perdue : le boîtier ferme seul.'}
+  finally{dgBusy=false}
+}
+(function(){
+  const b=$('dgHold');
+  b.addEventListener('pointerdown',e=>{if(b.disabled||dgTimer)return;e.preventDefault();try{b.setPointerCapture(e.pointerId)}catch(x){}
+    $('dgMsg').textContent='';const id=dgId=Date.now()%1000000000+1;b.textContent='OUVERT – relâche pour fermer';
+    dgTimer=setInterval(()=>dgRenew(id),150);dgRenew(id)});
+  const up=()=>{if(dgTimer)dgStop()};
+  ['pointerup','pointercancel','lostpointercapture'].forEach(v=>b.addEventListener(v,up));
+  b.addEventListener('contextmenu',e=>e.preventDefault());
+  document.addEventListener('visibilitychange',()=>{if(document.hidden&&dgId){dgStop();$('dgArm').checked=false;dgUI()}});
+  setInterval(()=>{if(curTab==4&&!dgTimer&&!document.hidden)dgApi().catch(()=>{})},500);
+  dgUI();
+})();
 </script>
 </body></html>

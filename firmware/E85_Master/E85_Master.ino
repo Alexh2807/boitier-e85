@@ -38,6 +38,9 @@
 #include <soc/gpio_reg.h>
 #include <soc/soc.h>
 #include <driver/gpio.h>
+#include <driver/mcpwm_prelude.h>
+#include <hal/mcpwm_ll.h>
+#include <hal/brownout_ll.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <esp_heap_caps.h>
@@ -53,7 +56,11 @@
 static const char *AP_SSID = "BoitierE85";
 static String AP_PASS = "ethanol123";               // par defaut ; modifiable depuis l'appli (memorise)
 static const uint8_t PIN_IN [3] = { 4, 5, 6 };
+#ifdef TEST_FREEZE   // test de la coupure materielle sur des broches NON branchees
+static const uint8_t PIN_OUT[3] = { 17, 18, 21 };
+#else
 static const uint8_t PIN_OUT[3] = { 7, 15, 16 };
+#endif
 #define FW_VERSION PROJECT_VERSION
 
 // ----------------------------- REGLAGES ------------------------------
@@ -85,19 +92,71 @@ struct Cyl {
   uint32_t stable, pend, pend_t, raw_last;
   uint32_t t_start, last_start, has_start, period;
   uint32_t ext_active, off_at;
+  uint32_t on, kick_t, stuck;
+  uint32_t man, man_t, man_len;
   // statistiques (lues par le coeur 0)
   volatile uint32_t pulses, width_t, ext_t, period_t, raw_edges;
 };
 static Cyl cyl[3];
 
 // ============================ TEMPS REEL ==============================
-static inline void IRAM_ATTR out_on (Cyl &c) { REG_WRITE(GPIO_OUT_W1TS_REG, c.out_mask); }
-static inline void IRAM_ATTR out_off(Cyl &c) { REG_WRITE(GPIO_OUT_W1TC_REG, c.out_mask); }
+// COUPURE MATERIELLE DES INJECTEURS
+// Les sorties ne passent plus par le registre GPIO, qui garde son dernier niveau si le
+// processeur se fige (un GPIO a 1 est bien plus fort que la resistance de rappel de la gate).
+// Chaque sortie passe par un timer MCPWM autonome qui la force a 0 au bout de HW_CUT_US s'il
+// n'est pas relance. La boucle le relance (kick) seulement pendant une injection legitime :
+// coeur fige, plantage, core dump, ecriture flash -> l'injecteur se ferme tout seul.
+#define HW_CUT_US     3000
+#define KICK_US       200
+#define MAX_ECU_ON_US 150000        // entree bloquee a 1 plus longtemps : sortie coupee jusqu'au prochain front
+static volatile uint32_t rt_stuck_n = 0;   // nombre de coupures pour entree bloquee
+static volatile uint32_t rt_freeze = 0;    // test uniquement
+// DIAGNOSTIC : commande manuelle des sorties. Le coeur 0 depose une duree (cycles), la boucle la
+// consomme. Le moindre front accepte venant de l'ECU annule tout.
+static volatile uint32_t rt_man_req[3];    // duree demandee (0 = rien)
+static volatile uint32_t rt_man_stop = 0;  // 1 = tout fermer et ignorer les demandes
+static volatile uint32_t rt_man_abort = 0; // 1 = annule par un signal de l'ECU
+static volatile uint32_t rt_man_on = 0;    // masque des sorties ouvertes a la main
+
+static inline __attribute__((always_inline)) void hw_force(int i, int level) {
+  mcpwm_ll_gen_set_noncontinue_force_level(&MCPWM0, i, 0, level);
+  mcpwm_ll_gen_trigger_noncontinue_force_action(&MCPWM0, i, 0);
+}
+static inline __attribute__((always_inline)) void hw_kick(int i) { mcpwm_ll_timer_trigger_soft_sync(&MCPWM0, i); }
+static inline __attribute__((always_inline)) void out_on (Cyl &c, int i) { hw_kick(i); hw_force(i, 1); c.on = 1; }
+static inline __attribute__((always_inline)) void out_off(Cyl &c, int i) { hw_force(i, 0); c.on = 0; }
+
+static bool hw_outputs_init() {
+  for (int i = 0; i < 3; i++) {
+    mcpwm_timer_handle_t tm; mcpwm_oper_handle_t op; mcpwm_gen_handle_t gen; mcpwm_sync_handle_t sy;
+    mcpwm_timer_config_t tc = {};
+    tc.group_id = 0; tc.clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT; tc.resolution_hz = 1000000;
+    tc.count_mode = MCPWM_TIMER_COUNT_MODE_UP; tc.period_ticks = HW_CUT_US;
+    if (mcpwm_new_timer(&tc, &tm) != ESP_OK) return false;
+    mcpwm_operator_config_t oc = {}; oc.group_id = 0;
+    if (mcpwm_new_operator(&oc, &op) != ESP_OK || mcpwm_operator_connect_timer(op, tm) != ESP_OK) return false;
+    mcpwm_generator_config_t gc = {}; gc.gen_gpio_num = PIN_OUT[i];
+    if (mcpwm_new_generator(op, &gc, &gen) != ESP_OK) return false;
+    if (mcpwm_generator_set_action_on_timer_event(gen,
+          MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_FULL, MCPWM_GEN_ACTION_LOW)) != ESP_OK) return false;
+    mcpwm_soft_sync_config_t sc = {};
+    if (mcpwm_new_soft_sync_src(&sc, &sy) != ESP_OK) return false;
+    mcpwm_timer_sync_phase_config_t pc = {};
+    pc.sync_src = sy; pc.count_value = 0; pc.direction = MCPWM_TIMER_DIRECTION_UP;
+    if (mcpwm_timer_set_phase_on_sync(tm, &pc) != ESP_OK) return false;
+    if (mcpwm_generator_set_force_level(gen, 0, false) != ESP_OK) return false;
+    if (mcpwm_timer_enable(tm) != ESP_OK || mcpwm_timer_start_stop(tm, MCPWM_TIMER_START_NO_STOP) != ESP_OK) return false;
+    gpio_set_drive_capability((gpio_num_t)PIN_OUT[i], GPIO_DRIVE_CAP_3);
+    gpio_input_enable((gpio_num_t)PIN_OUT[i]);      // relecture de la sortie reelle
+  }
+  return true;
+}
 
 // noinline : sinon le compilateur l'integre dans setup() (en flash) et perd l'IRAM
 static void __attribute__((noinline)) IRAM_ATTR rt_loop() {
   uint32_t last = esp_cpu_get_cycle_count();
   uint32_t sim_phase = 0;
+  const uint32_t kick_t = KICK_US * TPU, max_on_t = MAX_ECU_ON_US * TPU;
   for (;;) {
     const uint32_t now = esp_cpu_get_cycle_count();
     const uint32_t gin = REG_READ(GPIO_IN_REG);
@@ -132,8 +191,10 @@ static void __attribute__((noinline)) IRAM_ATTR rt_loop() {
           c.stable = lvl; c.pend = 0;
           if (lvl) {
             // ===== DEBUT INJECTION ECU =====
-            out_on(c);
-            c.ext_active = 0;
+            if (!sim && rt_man_on) { rt_man_stop = 1; rt_man_abort = 1; }
+            c.man = 0;
+            out_on(c, i);
+            c.ext_active = 0; c.stuck = 0; c.kick_t = now;
             if (c.has_start) {
               const uint32_t p = t - c.last_start;
               c.period = (p >= PERIOD_MIN_T && p <= PERIOD_MAX_T) ? p : 0;
@@ -146,7 +207,7 @@ static void __attribute__((noinline)) IRAM_ATTR rt_loop() {
             const uint32_t w = t - c.t_start;
             uint32_t ext = 0;
             const uint32_t dead = rt_dead_t;
-            if (rt_enabled && w > dead) {
+            if (rt_enabled && w > dead && !c.stuck) {
               ext = (uint32_t)(((uint64_t)(w - dead) * rt_fq[i]) >> 16);
               const uint32_t mx = rt_maxext_t;
               if (ext > mx) ext = mx;
@@ -157,7 +218,7 @@ static void __attribute__((noinline)) IRAM_ATTR rt_loop() {
             }
             c.width_t = w; c.ext_t = ext;
             if (ext) { c.off_at = t + ext; c.ext_active = 1; }
-            else     { out_off(c); }
+            else     { out_off(c, i); }
           }
         }
       } else {
@@ -166,8 +227,30 @@ static void __attribute__((noinline)) IRAM_ATTR rt_loop() {
 
       // --- fin du prolongement ---
       if (c.ext_active && (int32_t)(now - c.off_at) >= 0) {
-        out_off(c);
+        out_off(c, i);
         c.ext_active = 0;
+      }
+
+      // --- commande manuelle (diagnostic) ---
+      const uint32_t mreq = rt_man_req[i];
+      if (mreq) {
+        rt_man_req[i] = 0;
+        if (!rt_man_stop && !sim && !c.stable && !c.ext_active) {
+          if (!c.man) { out_on(c, i); c.kick_t = now; }
+          c.man = 1; c.man_t = now; c.man_len = mreq; rt_man_on = rt_man_on | (1u << i);
+        }
+      }
+      if (c.man && (rt_man_stop || now - c.man_t >= c.man_len)) { out_off(c, i); c.man = 0; }
+      if (!c.man) rt_man_on = rt_man_on & ~(1u << i);
+
+      if (c.on) {
+        // entree bloquee a 1 (PC817, fil, ECU) : on n'arrose pas le moteur indefiniment
+        if (!c.man && !c.ext_active && now - c.t_start > max_on_t) { out_off(c, i); c.stuck = 1; rt_stuck_n = rt_stuck_n + 1; }
+        // relance du timer de coupure materielle, seulement tant que l'injection est legitime
+        else if (now - c.kick_t > kick_t) { c.kick_t = now; hw_kick(i); }
+#ifdef TEST_FREEZE
+        if (rt_freeze && i == 0) { for (;;) { } }      // coeur fige, sortie a 1
+#endif
       }
     }
   }
@@ -500,6 +583,83 @@ static void h_ped() {
   send_json();
 }
 
+// ===================== DIAGNOSTIC : COMMANDE MANUELLE DES SORTIES =====================
+//  /api/man                         : etat seul
+//  /api/man?op=pulse&cyl=<masque>&ms=<1..20>&n=<1..20>   : impulsions (5 par seconde)
+//  /api/man?op=hold&cyl=<masque>&id=<n>   : maintien, a renouveler (< 600 ms), 5 s au maximum
+//  /api/man?op=stop&id=<n>          : tout fermer
+#define MAN_RENEW_MS 600
+#define MAN_HOLD_MS  5000
+static uint32_t g_mn_id = 0, g_mn_closed = 0, g_mn_t0 = 0;
+static uint32_t g_mp_mask = 0, g_mp_ms = 0, g_mp_left = 0, g_mp_next = 0;
+static bool e85_installing();
+
+// nullptr si la commande est autorisee, sinon la raison du refus
+static const char *man_refuse() {
+  if (g_engine_on) return "refuse : moteur tournant";
+  for (int i = 0; i < 3; i++) {
+    if (g_last_pulse_ms[i] && millis() - g_last_pulse_ms[i] < 3000) return "refuse : impulsions recues de l'ECU";
+    if (cyl[i].stable) return "refuse : une entree est active (voir tableau)";
+  }
+  if (rt_sim) return "refuse : simulateur actif";
+  if (g_e85_ota || e85_installing()) return "refuse : mise a jour en cours";
+  return nullptr;
+}
+static void man_stop() { g_mp_left = 0; rt_man_stop = 1; }
+static void man_fire(uint32_t mask, uint32_t ms) {
+  for (int i = 0; i < 3; i++) if (mask >> i & 1) rt_man_req[i] = ms * 1000UL * TPU;
+}
+static void man_step(uint32_t ms) {          // appele par comm_task : suite d'impulsions
+  if (!g_mp_left || (int32_t)(ms - g_mp_next) < 0) return;
+  if (rt_man_stop || man_refuse()) { man_stop(); return; }
+  man_fire(g_mp_mask, g_mp_ms);
+  g_mp_left--; g_mp_next = ms + 200;
+}
+static void h_man() {
+  const String op = server.arg("op");
+  const char *why = nullptr;
+  if (op == "stop") {
+    man_stop();
+    g_mn_closed = strtoul(server.arg("id").c_str(), nullptr, 10);
+  } else if (op == "pulse" || op == "hold") {
+    const uint32_t mask = server.arg("cyl").toInt() & 7;
+    why = man_refuse();
+    if (!why && !mask) why = "aucune sortie choisie";
+    if (!why && op == "pulse") {
+      if (!g_mp_left) {
+        rt_man_abort = 0; rt_man_stop = 0;
+        g_mp_mask = mask;
+        g_mp_ms = constrain(server.arg("ms").toInt(), 1, 20);
+        g_mp_left = constrain(server.arg("n").toInt(), 1, 20);
+        g_mp_next = millis();
+      }
+    } else if (!why) {
+      const uint32_t id = strtoul(server.arg("id").c_str(), nullptr, 10);
+      if (!id || id == g_mn_closed) why = "maintien termine";
+      else {
+        if (id != g_mn_id) { g_mn_id = id; g_mn_t0 = millis(); g_mp_left = 0; rt_man_abort = 0; rt_man_stop = 0; }
+        const uint32_t el = millis() - g_mn_t0;
+        if (el >= MAN_HOLD_MS)  { g_mn_closed = id; man_stop(); why = "limite de 5 s atteinte"; }
+        else if (rt_man_stop)   { g_mn_closed = id; why = "annule : signal de l'ECU"; }
+        else man_fire(mask, min<uint32_t>(MAN_RENEW_MS, MAN_HOLD_MS - el));
+      }
+    }
+    if (why && why[0] == 'r') man_stop();
+  }
+  delay(2);                                  // laisse la sortie changer avant la relecture
+  char b[420];
+  int n = snprintf(b, sizeof(b), "{\"on\":%lu,\"left\":%lu,\"abort\":%lu,\"why\":\"%s\",\"stuck\":%lu,\"rpm\":%u,\"cyl\":[",
+                   (unsigned long)rt_man_on, (unsigned long)g_mp_left, (unsigned long)rt_man_abort, why ? why : "",
+                   (unsigned long)rt_stuck_n, g_rpm);
+  for (int i = 0; i < 3; i++)
+    n += snprintf(b + n, sizeof(b) - n, "%s{\"in\":%d,\"out\":%d,\"n\":%lu,\"e\":%lu}", i ? "," : "",
+                  gpio_get_level((gpio_num_t)PIN_IN[i]), gpio_get_level((gpio_num_t)PIN_OUT[i]),
+                  (unsigned long)cyl[i].pulses, (unsigned long)cyl[i].raw_edges);
+  snprintf(b + n, sizeof(b) - n, "]}");
+  cors();
+  server.send(200, "application/json", b);
+}
+
 static void h_pedcmd() {
   int c = server.arg("c").toInt();
   if (c >= CMD_CAL_RELEASED && c <= CMD_DEFAULTS) send_ped_cmd((uint8_t)c);
@@ -743,11 +903,13 @@ static void monitor_task(void *) {
 }
 
 // morceau de JSON : etat de la mise a jour E85 + journal d'incidents, termine par "pota":{
+static bool e85_installing() { return g_e85u == E85U_INSTALL; }
+
 static int json_extra(char *b, size_t sz) {
   int n = snprintf(b, sz, "\"e85u\":{\"st\":%d,\"done\":%u,\"size\":%u,\"err\":\"%s\",\"psram\":%u},",
                    (int)g_e85u, (unsigned)g_e85u_done, (unsigned)g_fw_len, g_e85u_err.c_str(),
                    (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024));
-  n += snprintf(b + n, sz - n, "\"diag\":{\"cnt\":[");
+  n += snprintf(b + n, sz - n, "\"stuck\":%lu,\"diag\":{\"cnt\":[", (unsigned long)rt_stuck_n);
   for (int i = 0; i < 12; i++) n += snprintf(b + n, sz - n, "%s%u", i ? "," : "", g_diag.cnt[i]);
   n += snprintf(b + n, sz - n, "]");
   if (g_diag.has_last) {
@@ -805,6 +967,7 @@ static void comm_task(void *) {
   server.on("/api/set",      h_set);
   server.on("/api/ped",      h_ped);
   server.on("/api/pedcmd",   h_pedcmd);
+  server.on("/api/man",      h_man);
   server.on("/api/save",     h_save);
   server.on("/api/defaults", h_defaults);
   server.on("/api/pedota",   h_pedota);
@@ -824,6 +987,7 @@ static void comm_task(void *) {
     g_crumb.pota_state = g_pota_state; g_crumb.pota_done = g_pota_done;
     const uint32_t ms = millis();
 
+    man_step(ms);
     if (ms - t_fast >= 20) {                 // 50 Hz : regime + derivee vers la pedale
       t_fast = ms;
       update_engine();
@@ -919,6 +1083,25 @@ static void comm_task(void *) {
       }
     }
 
+#ifdef TEST_FREEZE
+    static bool tf = false;
+    if (ms > 4000 && !rt_sim && !tf) { S.pct10 = 250; S.trim10[0] = 0; S.sim_rpm = 900; S.sim_pw_us = 8000; S.enabled = 1; S.dead_us = 0; apply_settings(); rt_sim = 1; }
+    if (ms > 9000 && !tf) {
+      tf = true;
+      uint32_t hi = 0, n = 0, t1 = micros();
+      while (micros() - t1 < 1333333) { hi += gpio_get_level((gpio_num_t)PIN_OUT[0]); n++; }
+      Serial.printf("[TEST] avant gel : sortie a 1 pendant %.3f %% du temps (attendu 7.500)\n", 100.0f * hi / n);
+      Serial.printf("[TEST] cyl1 pw=%lu us ext=%lu us\n", (unsigned long)(cyl[0].width_t / TPU), (unsigned long)(cyl[0].ext_t / TPU));
+      while (gpio_get_level((gpio_num_t)PIN_OUT[0])) {}
+      rt_freeze = 1;
+      while (!gpio_get_level((gpio_num_t)PIN_OUT[0])) {}
+      uint32_t t0 = micros();
+      while (gpio_get_level((gpio_num_t)PIN_OUT[0]) && micros() - t0 < 1000000) {}
+      Serial.printf("[TEST] coeur 1 FIGE sortie a 1 -> coupee par le materiel apres %lu us\n", (unsigned long)(micros() - t0));
+      hi = 0; t0 = micros(); while (micros() - t0 < 1000000) hi += gpio_get_level((gpio_num_t)PIN_OUT[0]) + gpio_get_level((gpio_num_t)PIN_OUT[1]) + gpio_get_level((gpio_num_t)PIN_OUT[2]);
+      Serial.printf("[TEST] 1 s apres : %lu lecture(s) a 1 sur les 3 sorties\n", (unsigned long)hi);
+    }
+#endif
     if (ms - t_log >= 2000) {
       t_log = ms;
       Serial.printf("[E85] rpm=%u on=%d ext=%.1f%% pw1=%luus ext1=%luus ped=%d sim=%d\n",
@@ -931,6 +1114,9 @@ static void comm_task(void *) {
 
 // ================================ SETUP ================================
 void setup() {
+  // redemarrage propre plus tot en cas de chute d'alimentation (reglage d'usine : le plus bas),
+  // avant la zone ou la flash et le processeur ne sont plus garantis
+  brownout_ll_set_threshold(5);
   // 1) sorties a l'etat bas le plus tot possible (injecteurs fermes)
   for (int i = 0; i < 3; i++) {
     gpio_reset_pin((gpio_num_t)PIN_OUT[i]);
@@ -965,6 +1151,9 @@ void setup() {
   xTaskCreatePinnedToCore(monitor_task, "mon", 3072, nullptr, 10, nullptr, 0);
 
   // 3) le coeur 1 (loopTask) devient la boucle temps reel - ne revient jamais
+  //    priorite elevee : aucune tache ordinaire ne peut la suspendre
+  if (!hw_outputs_init()) { delay(2000); Serial.println("[FATAL] sorties MCPWM"); delay(200); esp_restart(); }
+  vTaskPrioritySet(nullptr, 20);
   disableCore1WDT();
   delay(50);
   rt_loop();
